@@ -26,7 +26,6 @@ async def catch_thala(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Delete the message
         try:
-            await update.message.delete()
         except Exception:
             pass
 
