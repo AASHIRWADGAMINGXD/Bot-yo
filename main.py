@@ -1,93 +1,97 @@
-# bot.py
-# Telegram anti-thala bot
-# Requires: pip install python-telegram-bot==21.5
+import discord
+from discord.ext import commands
+from discord.ui import Button, View
 
-import os
-from telegram import Update, ChatPermissions
-from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+intents.members = True
 
-TOKEN = os.getenv("BOT_TOKEN")  # set in environment variables
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-if not TOKEN:
-    raise SystemExit("Missing BOT_TOKEN environment variable")
+# When bot is ready
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user}")
 
-# Track user spam count
-user_spam_count = {}
+# --- Ticket System ---
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+async def ticket(ctx):
+    """Send ticket creation button"""
+    button = Button(label="Create Ticket", style=discord.ButtonStyle.green, custom_id="create_ticket")
 
-# --- Handler: when message contains "thala" ---
-async def catch_thala(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
+    async def button_callback(interaction: discord.Interaction):
+        guild = interaction.guild
+        user = interaction.user
+        existing_channel = discord.utils.get(guild.text_channels, name=f"ticket-{user.name.lower()}")
+        if existing_channel:
+            await interaction.response.send_message("You already have a ticket open.", ephemeral=True)
+            return
 
-    text = update.message.text.lower()
-    if "thala" in text:
-        user_id = update.message.from_user.id
-        chat_id = update.message.chat_id
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            user: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        }
 
-        # Delete the message
-        try:
-        except Exception:
-            pass
+        channel = await guild.create_text_channel(f"ticket-{user.name}", overwrites=overwrites)
+        await channel.send(f"{user.mention}, thank you for opening a ticket. A staff member will assist you soon.")
+        await interaction.response.send_message(f"Ticket created: {channel.mention}", ephemeral=True)
 
-        # Reply funny text
-        await context.bot.send_message(chat_id, "Tera upar bala")
+    button.callback = button_callback
+    view = View()
+    view.add_item(button)
+    await ctx.send("Click below to create a ticket:", view=view)
 
-        # Count spam
-        user_spam_count[user_id] = user_spam_count.get(user_id, 0) + 1
+# --- Close Ticket Command ---
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+async def close(ctx):
+    """Close the ticket channel"""
+    if ctx.channel.name.startswith("ticket-"):
+        await ctx.send("Closing this ticket in 5 seconds...")
+        await discord.utils.sleep_until(discord.utils.utcnow() + discord.utils.timedelta(seconds=5))
+        await ctx.channel.delete()
+    else:
+        await ctx.send("This command can only be used inside a ticket channel.")
 
-        # If spammed 3+ times, mute for 10 mins
-        if user_spam_count[user_id] >= 3:
-            try:
-                await context.bot.restrict_chat_member(
-                    chat_id,
-                    user_id,
-                    ChatPermissions(can_send_messages=False),
-                    until_date=None
-                )
-                await context.bot.send_message(chat_id, f"User {update.message.from_user.first_name} muted for spam 🚫")
-            except Exception as e:
-                print("Failed to mute:", e)
+# --- Moderation Commands ---
+@bot.command()
+@commands.has_permissions(kick_members=True)
+async def kick(ctx, member: discord.Member, *, reason=None):
+    await member.kick(reason=reason)
+    await ctx.send(f"{member} has been kicked.")
 
-# --- Command: /clearthala (admin only) ---
-async def clear_thala(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def ban(ctx, member: discord.Member, *, reason=None):
+    await member.ban(reason=reason)
+    await ctx.send(f"{member} has been banned.")
 
-    chat = update.message.chat
-    user = update.message.from_user
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def mute(ctx, member: discord.Member, *, reason=None):
+    guild = ctx.guild
+    muted_role = discord.utils.get(guild.roles, name="Muted")
 
-    # Only admins can use
-    member = await chat.get_member(user.id)
-    if not (member.status in ["administrator", "creator"]):
-        await update.message.reply_text("You’re not an admin.")
-        return
+    if not muted_role:
+        muted_role = await guild.create_role(name="Muted")
+        for channel in guild.channels:
+            await channel.set_permissions(muted_role, send_messages=False, speak=False)
 
-    await update.message.reply_text("Clearing all 'thala' messages...")
+    await member.add_roles(muted_role, reason=reason)
+    await ctx.send(f"{member} has been muted.")
 
-    async for msg in chat.get_history(limit=500):
-        if msg.text and "thala" in msg.text.lower():
-            try:
-                await msg.delete()
-            except Exception:
-                pass
+# --- Unmute Command ---
+@bot.command()
+@commands.has_permissions(manage_roles=True)
+async def unmute(ctx, member: discord.Member):
+    muted_role = discord.utils.get(ctx.guild.roles, name="Muted")
+    if muted_role in member.roles:
+        await member.remove_roles(muted_role)
+        await ctx.send(f"{member} has been unmuted.")
+    else:
+        await ctx.send("That user is not muted.")
 
-    await update.message.reply_text("All 'thala' messages removed ✅")
-
-# --- Start command ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot active — any 'thala' message will be deleted automatically.")
-
-# --- Main ---
-def main():
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("clearthala", clear_thala))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, catch_thala))
-
-    print("Bot running...")
-    app.run_polling()
-
-if __name__ == "__main__":
-    main()
-
+# --- Run Bot ---
+bot.run("YOUR_BOT_TOKEN")
