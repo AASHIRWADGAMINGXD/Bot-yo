@@ -3,6 +3,7 @@ from discord.ext import commands
 from discord.ui import Button, View
 import os
 import asyncio
+from keep_alive import keep_alive
 
 # --- CONFIGURATION ---
 # Load token from Environment Variable (Secure for Render)
