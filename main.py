@@ -119,5 +119,3 @@ if __name__ == "__main__":
     keep_alive() # Start the web server
     if TOKEN:
         bot.run(TOKEN)
-    else:
-        print("Error: DISCORD_TOKEN not found in environment variables.")
