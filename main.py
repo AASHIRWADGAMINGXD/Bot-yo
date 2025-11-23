@@ -1,97 +1,122 @@
 import discord
 from discord.ext import commands
 from discord.ui import Button, View
+import os
+import asyncio
 
+# --- CONFIGURATION ---
+# Load token from Environment Variable (Secure for Render)
+TOKEN = os.getenv("DISCORD_TOKEN") 
+GITHUB_REPO_LINK = "https://github.com/YourUsername/YourRepo" # Change this
+
+# Setup Intents
 intents = discord.Intents.default()
 intents.message_content = True
-intents.guilds = True
-intents.members = True
+intents.members = True # Required for Kick/Ban and Tickets
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Define Bot
+class MyBot(commands.Bot):
+    def __init__(self):
+        super().__init__(
+            command_prefix="!",
+            intents=intents,
+            help_command=None,
+            activity=discord.Game(name="Moderating..."),
+            status=discord.Status.dnd # SET STATUS TO DND
+        )
 
-# When bot is ready
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
+    async def on_ready(self):
+        print(f'Logged in as {self.user} (ID: {self.user.id})')
+        print('------')
+        # Make ticket view persistent (listen for clicks even after restart)
+        self.add_view(TicketLauncher())
 
-# --- Ticket System ---
-@bot.command()
-@commands.has_permissions(manage_channels=True)
-async def ticket(ctx):
-    """Send ticket creation button"""
-    button = Button(label="Create Ticket", style=discord.ButtonStyle.green, custom_id="create_ticket")
+bot = MyBot()
 
-    async def button_callback(interaction: discord.Interaction):
-        guild = interaction.guild
-        user = interaction.user
-        existing_channel = discord.utils.get(guild.text_channels, name=f"ticket-{user.name.lower()}")
-        if existing_channel:
-            await interaction.response.send_message("You already have a ticket open.", ephemeral=True)
-            return
+# --- MODERATION COMMANDS ---
 
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            user: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-        }
-
-        channel = await guild.create_text_channel(f"ticket-{user.name}", overwrites=overwrites)
-        await channel.send(f"{user.mention}, thank you for opening a ticket. A staff member will assist you soon.")
-        await interaction.response.send_message(f"Ticket created: {channel.mention}", ephemeral=True)
-
-    button.callback = button_callback
-    view = View()
-    view.add_item(button)
-    await ctx.send("Click below to create a ticket:", view=view)
-
-# --- Close Ticket Command ---
-@bot.command()
-@commands.has_permissions(manage_channels=True)
-async def close(ctx):
-    """Close the ticket channel"""
-    if ctx.channel.name.startswith("ticket-"):
-        await ctx.send("Closing this ticket in 5 seconds...")
-        await discord.utils.sleep_until(discord.utils.utcnow() + discord.utils.timedelta(seconds=5))
-        await ctx.channel.delete()
-    else:
-        await ctx.send("This command can only be used inside a ticket channel.")
-
-# --- Moderation Commands ---
 @bot.command()
 @commands.has_permissions(kick_members=True)
 async def kick(ctx, member: discord.Member, *, reason=None):
+    """Kicks a member."""
     await member.kick(reason=reason)
-    await ctx.send(f"{member} has been kicked.")
+    await ctx.send(f'User {member} has been kicked. Reason: {reason}')
 
 @bot.command()
 @commands.has_permissions(ban_members=True)
 async def ban(ctx, member: discord.Member, *, reason=None):
+    """Bans a member."""
     await member.ban(reason=reason)
-    await ctx.send(f"{member} has been banned.")
+    await ctx.send(f'User {member} has been banned. Reason: {reason}')
 
 @bot.command()
-@commands.has_permissions(manage_roles=True)
-async def mute(ctx, member: discord.Member, *, reason=None):
-    guild = ctx.guild
-    muted_role = discord.utils.get(guild.roles, name="Muted")
+@commands.has_permissions(manage_messages=True)
+async def clear(ctx, amount: int):
+    """Clears chat messages."""
+    await ctx.channel.purge(limit=amount + 1)
+    await ctx.send(f'Cleared {amount} messages.', delete_after=3)
 
-    if not muted_role:
-        muted_role = await guild.create_role(name="Muted")
-        for channel in guild.channels:
-            await channel.set_permissions(muted_role, send_messages=False, speak=False)
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("You don't have permission to use this command!")
 
-    await member.add_roles(muted_role, reason=reason)
-    await ctx.send(f"{member} has been muted.")
+# --- GITHUB COMMAND ---
 
-# --- Unmute Command ---
 @bot.command()
-@commands.has_permissions(manage_roles=True)
-async def unmute(ctx, member: discord.Member):
-    muted_role = discord.utils.get(ctx.guild.roles, name="Muted")
-    if muted_role in member.roles:
-        await member.remove_roles(muted_role)
-        await ctx.send(f"{member} has been unmuted.")
+async def github(ctx):
+    """Sends the GitHub repository link."""
+    embed = discord.Embed(title="GitHub Repository", description="Check out the source code below:", color=discord.Color.dark_grey())
+    embed.add_field(name="Link", value=GITHUB_REPO_LINK)
+    await ctx.send(embed=embed)
+
+# --- TICKET SYSTEM (UI BASED) ---
+
+# Button to Close Ticket
+class CloseButton(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="ticket_close")
+    async def close(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message("Closing this ticket in 5 seconds...")
+        await asyncio.sleep(5)
+        await interaction.channel.delete()
+
+# Button to Open Ticket
+class TicketLauncher(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Create Ticket", style=discord.ButtonStyle.green, emoji="📩", custom_id="ticket_create")
+    async def create_ticket(self, interaction: discord.Interaction, button: Button):
+        guild = interaction.guild
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        }
+        
+        # Check if user already has a ticket (optional logic can go here)
+        
+        channel_name = f"ticket-{interaction.user.name}"
+        channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites)
+        
+        await interaction.response.send_message(f"Ticket created! Check {channel.mention}", ephemeral=True)
+        
+        embed = discord.Embed(title="Support Ticket", description=f"Hello {interaction.user.mention}, a staff member will be with you shortly.", color=discord.Color.blue())
+        await channel.send(embed=embed, view=CloseButton())
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def setup_ticket(ctx):
+    """Spawns the ticket creation message."""
+    embed = discord.Embed(title="Support System", description="Click the button below to open a ticket!", color=discord.Color.green())
+    await ctx.send(embed=embed, view=TicketLauncher())
+
+# --- RUN BOT ---
+if __name__ == "__main__":
+    if TOKEN:
+        bot.run(TOKEN)
     else:
-        await ctx.send("That user is not muted.")
-
-# --- Run Bot ---
-bot.run("YOUR_BOT_TOKEN")
+        print("Error: DISCORD_TOKEN not found in environment variables.")
