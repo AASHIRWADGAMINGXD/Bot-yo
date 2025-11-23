@@ -116,6 +116,7 @@ async def setup_ticket(ctx):
 
 # --- RUN BOT ---
 if __name__ == "__main__":
+    keep_alive() # Start the web server
     if TOKEN:
         bot.run(TOKEN)
     else:
