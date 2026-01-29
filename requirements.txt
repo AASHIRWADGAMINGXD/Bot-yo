@@ -1,3 +1,5 @@
 discord.py 
-flask 
-aiohttp
+python-dotenv
+pytesseract 
+pillow 
+flask
