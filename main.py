@@ -12,37 +12,37 @@ from flask import Flask
 from threading import Thread
 from dotenv import load_dotenv
 
-# --- 1. CONFIGURATION & IMPORTS ---
+# --- 1. CONFIGURATION & SETUP ---
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 OWNER_ID_ENV = os.getenv("OWNER_ID")
 
-# Safe Owner ID conversion
+# Handle Owner ID
 try:
     OWNER_ID = int(OWNER_ID_ENV) if OWNER_ID_ENV else None
 except (ValueError, TypeError):
-    print("⚠️ OWNER_ID in .env is invalid or missing.")
+    print("⚠️ OWNER_ID in .env is invalid. Some owner commands may not work.")
     OWNER_ID = None
 
-# OCR Setup (Image Text Reading for Crypto Blocker)
+# OCR Setup (Image Text Reading)
 try:
     from PIL import Image
     import pytesseract
-    # Un-comment below if on Windows and Tesseract isn't in PATH:
-    # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+    # Note: Tesseract must be installed on the OS level for this to work.
+    # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe' 
     OCR_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
-    print("⚠️ Warning: PIL/pytesseract missing. Image scanning disabled.")
+    print("⚠️ PIL or pytesseract not found. Image scanning features disabled.")
 
-# Bot Initialization
+# Bot Instance
 intents = discord.Intents.all()
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 if OWNER_ID:
     bot.owner_id = OWNER_ID
 
-# --- 2. DATABASE SYSTEM (SQLite) ---
+# --- 2. DATABASE (SQLite) ---
 
 conn = sqlite3.connect("ultimate_bot.db", check_same_thread=False)
 c = conn.cursor()
@@ -64,44 +64,38 @@ def init_db():
     # Blocked Words
     c.execute('''CREATE TABLE IF NOT EXISTS block_words (guild_id INTEGER, word TEXT)''')
     
-    # Blocked Roles (Naming Restriction)
+    # Blocked Role Names
     c.execute('''CREATE TABLE IF NOT EXISTS blocked_roles (guild_id INTEGER, name TEXT)''')
     
     # Tickets
     c.execute('''CREATE TABLE IF NOT EXISTS tickets (channel_id INTEGER PRIMARY KEY, owner_id INTEGER, guild_id INTEGER)''')
     
-    # Premium Users
+    # Premium
     c.execute('''CREATE TABLE IF NOT EXISTS premium (user_id INTEGER PRIMARY KEY, expiry TEXT, type TEXT)''')
     
-    # Moderation - Warns
+    # Moderation Logs
     c.execute('''CREATE TABLE IF NOT EXISTS warns (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, guild_id INTEGER, reason TEXT, mod_id INTEGER, timestamp TEXT)''')
-    
-    # Moderation - Notes
     c.execute('''CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, guild_id INTEGER, note TEXT, author_id INTEGER)''')
     
-    # AFK System
+    # Utilities
     c.execute('''CREATE TABLE IF NOT EXISTS afk (user_id INTEGER, guild_id INTEGER, reason TEXT, timestamp TEXT)''')
-    
-    # Reaction Roles
     c.execute('''CREATE TABLE IF NOT EXISTS reaction_roles (message_id INTEGER, emoji TEXT, role_id INTEGER, guild_id INTEGER)''')
-    
-    # Temp Roles
     c.execute('''CREATE TABLE IF NOT EXISTS temp_roles (user_id INTEGER, guild_id INTEGER, role_id INTEGER, expiry_timestamp REAL)''')
     
-    # Bot Internals
+    # Bot Config
     c.execute('''CREATE TABLE IF NOT EXISTS bot_config (key TEXT PRIMARY KEY, value TEXT)''')
     
     conn.commit()
 
 init_db()
 
-# --- 3. FLASK SERVER (Keep Alive) ---
+# --- 3. FLASK KEEP ALIVE ---
 
 app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot System Online | 200 OK"
+    return "Bot Status: ONLINE | 200 OK"
 
 def run_flask():
     app.run(host='0.0.0.0', port=8080)
@@ -110,15 +104,15 @@ def keep_alive():
     t = Thread(target=run_flask)
     t.start()
 
-# --- 4. CHECKS & UTILS ---
+# --- 4. GLOBAL CHECKS ---
 
-def is_maintenance_active():
+def is_maintenance_mode():
     cursor = conn.cursor()
     cursor.execute("SELECT value FROM bot_config WHERE key = 'maintenance'")
     res = cursor.fetchone()
     return True if res and res[0] == "1" else False
 
-def is_user_premium(user_id):
+def check_premium_status(user_id):
     cursor = conn.cursor()
     cursor.execute("SELECT expiry FROM premium WHERE user_id = ?", (user_id,))
     res = cursor.fetchone()
@@ -130,28 +124,28 @@ def is_user_premium(user_id):
     except: pass
     return False
 
-# Custom Decorators
+# Decorators
 def premium_only():
     async def predicate(ctx):
-        if not is_user_premium(ctx.author.id):
+        if not check_premium_status(ctx.author.id):
             raise commands.CheckFailure("PREMIUM_REQUIRED")
         return True
     return commands.check(predicate)
 
 def maintenance_check():
     async def predicate(ctx):
-        if is_maintenance_active() and ctx.author.id != bot.owner_id:
-            raise commands.CheckFailure("MAINTENANCE_MODE")
+        if is_maintenance_mode() and ctx.author.id != bot.owner_id:
+            raise commands.CheckFailure("MAINTENANCE_ACTIVE")
         return True
     return commands.check(predicate)
 
-# --- 5. TICKET VIEWS ---
+# --- 5. TICKET SYSTEM ---
 
 class TicketView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="📩 Create Ticket", style=discord.ButtonStyle.green, custom_id="btn_create_ticket")
+    @discord.ui.button(label="📩 Create Ticket", style=discord.ButtonStyle.green, custom_id="btn_ticket_create")
     async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         c.execute("SELECT ticket_category FROM guild_config WHERE guild_id = ?", (interaction.guild.id,))
         res = c.fetchone()
@@ -162,16 +156,15 @@ class TicketView(discord.ui.View):
             interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
             interaction.guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
         }
-        
-        # Ticket Tag (Name)
-        ch_name = f"ticket-{interaction.user.name}-{random.randint(1000,9999)}"
+
+        ch_name = f"ticket-{interaction.user.name}-{random.randint(100,999)}"
         channel = await interaction.guild.create_text_channel(name=ch_name, category=cat, overwrites=overwrites)
         
         c.execute("INSERT INTO tickets (channel_id, owner_id, guild_id) VALUES (?, ?, ?)", 
                   (channel.id, interaction.user.id, interaction.guild.id))
         conn.commit()
         
-        embed = discord.Embed(title="Ticket Open", description="Support will be here soon.\nAdmin tools below.", color=discord.Color.blue())
+        embed = discord.Embed(title="Ticket Open", description="Support staff will be with you shortly.", color=discord.Color.blue())
         await channel.send(f"{interaction.user.mention}", embed=embed, view=TicketControls())
         await interaction.response.send_message(f"Ticket created: {channel.mention}", ephemeral=True)
 
@@ -179,25 +172,24 @@ class TicketControls(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🔒 Close", style=discord.ButtonStyle.red, custom_id="btn_close_ticket")
+    @discord.ui.button(label="🔒 Close", style=discord.ButtonStyle.red, custom_id="btn_ticket_close")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer()
         
         # Transcript
-        messages = [m async for m in interaction.channel.history(limit=500, oldest_first=True)]
-        transcript = f"TRANSCRIPT - {interaction.channel.name}\n" + "="*30 + "\n"
-        for m in messages:
-            transcript += f"[{m.created_at.strftime('%Y-%m-%d %H:%M')}] {m.author}: {m.content}\n"
+        msgs = [m async for m in interaction.channel.history(limit=500, oldest_first=True)]
+        text = f"TRANSCRIPT - {interaction.channel.name}\n" + "="*30 + "\n"
+        for m in msgs:
+            text += f"[{m.created_at.strftime('%Y-%m-%d %H:%M')}] {m.author}: {m.content}\n"
         
-        file = discord.File(io.BytesIO(transcript.encode()), filename=f"transcript-{interaction.channel.id}.txt")
+        f = discord.File(io.BytesIO(text.encode()), filename=f"transcript-{interaction.channel.id}.txt")
         
-        # Log to Channel
         c.execute("SELECT ticket_transcript_channel FROM guild_config WHERE guild_id = ?", (interaction.guild.id,))
         res = c.fetchone()
         if res and res[0]:
-            log_chan = interaction.guild.get_channel(res[0])
-            if log_chan:
-                await log_chan.send(embed=discord.Embed(title="Ticket Closed", description=f"Closed by {interaction.user}"), file=file)
+            log_c = interaction.guild.get_channel(res[0])
+            if log_c:
+                await log_c.send(embed=discord.Embed(title="Ticket Closed", description=f"By: {interaction.user}"), file=f)
         
         c.execute("DELETE FROM tickets WHERE channel_id = ?", (interaction.channel.id,))
         conn.commit()
@@ -212,7 +204,7 @@ class AdminCog(commands.Cog):
     @commands.hybrid_command(name="setup_tickets")
     @commands.has_permissions(administrator=True)
     async def setup_tickets(self, ctx, category: discord.CategoryChannel, transcript_channel: discord.TextChannel):
-        """Configure ticket category and transcript log channel."""
+        """Configure the ticket system."""
         c.execute("INSERT OR REPLACE INTO guild_config (guild_id, ticket_category, ticket_transcript_channel) VALUES (?, ?, ?)",
                   (ctx.guild.id, category.id, transcript_channel.id))
         conn.commit()
@@ -221,15 +213,15 @@ class AdminCog(commands.Cog):
     @commands.hybrid_command(name="ticket_panel")
     @commands.has_permissions(administrator=True)
     async def ticket_panel(self, ctx):
-        """Send the Create Ticket panel."""
-        embed = discord.Embed(title="Support", description="Click below to open a ticket.", color=discord.Color.green())
+        """Send the ticket creation message."""
+        embed = discord.Embed(title="Support", description="Click to open a ticket.", color=discord.Color.blue())
         embed.set_image(url="https://dummyimage.com/600x200/2f3136/ffffff&text=Support+Team") 
         await ctx.send(embed=embed, view=TicketView())
 
     @commands.hybrid_command()
     @commands.has_permissions(administrator=True)
     async def anti_raid(self, ctx, mode: str):
-        """Set Basic Anti-Raid [on/off]."""
+        """Toggle Basic Anti-Raid [on/off]."""
         val = 1 if mode.lower() == "on" else 0
         c.execute("UPDATE guild_config SET anti_raid = ? WHERE guild_id = ?", (val, ctx.guild.id))
         conn.commit()
@@ -238,7 +230,7 @@ class AdminCog(commands.Cog):
     @commands.hybrid_command()
     @commands.has_permissions(administrator=True)
     async def auto_mode(self, ctx, mode: str):
-        """Set Auto Mode (Link Blocker) [on/off]."""
+        """Toggle Auto Mode (Link Blocker) [on/off]."""
         val = 1 if mode.lower() == "on" else 0
         c.execute("UPDATE guild_config SET auto_mode = ? WHERE guild_id = ?", (val, ctx.guild.id))
         conn.commit()
@@ -247,27 +239,26 @@ class AdminCog(commands.Cog):
     @commands.hybrid_command()
     @commands.has_permissions(administrator=True)
     async def add_admin(self, ctx, role: discord.Role):
-        """Add admin permissions to a role (Simulated)."""
-        # In a real bot, we might add this role ID to a DB table for permission checks
+        """(Simulated) Add admin rights to a role."""
         await ctx.send(f"✅ {role.name} added to Bot Admins.")
 
     @commands.hybrid_command()
     @commands.has_permissions(administrator=True)
     async def remove_admin(self, ctx, role: discord.Role):
-        """Remove admin permissions."""
+        """(Simulated) Remove admin rights."""
         await ctx.send(f"✅ {role.name} removed from Bot Admins.")
 
     @commands.hybrid_command()
     @commands.has_permissions(administrator=True)
     async def announce(self, ctx, channel: discord.TextChannel, *, message: str):
-        """Send an announcement to a channel."""
+        """Announce a message."""
         await channel.send(message)
-        await ctx.send("✅ Announcement sent.")
+        await ctx.send("✅ Sent.")
 
     @commands.hybrid_command()
     @commands.has_permissions(administrator=True)
     async def block_r(self, ctx, role_name: str):
-        """Restrict a role name so it cannot be created."""
+        """Restrict a role name."""
         c.execute("INSERT INTO blocked_roles (guild_id, name) VALUES (?, ?)", (ctx.guild.id, role_name.lower()))
         conn.commit()
         await ctx.send(f"🚫 Role name restricted: {role_name}")
@@ -305,23 +296,20 @@ class ModCog(commands.Cog):
     @commands.hybrid_command()
     @commands.has_permissions(manage_messages=True)
     async def blockwords(self, ctx, word: str):
-        """Add a word to the blocklist."""
         c.execute("INSERT INTO block_words (guild_id, word) VALUES (?, ?)", (ctx.guild.id, word.lower()))
         conn.commit()
-        await ctx.send(f"🚫 Blocked word: {word}")
+        await ctx.send(f"🚫 Blocked: {word}")
 
     @commands.hybrid_command()
     @commands.has_permissions(manage_messages=True)
     async def unblockwords(self, ctx, word: str):
-        """Remove a word from the blocklist."""
         c.execute("DELETE FROM block_words WHERE guild_id = ? AND word = ?", (ctx.guild.id, word.lower()))
         conn.commit()
-        await ctx.send(f"✅ Unblocked word: {word}")
+        await ctx.send(f"✅ Unblocked: {word}")
         
     @commands.hybrid_command()
     @commands.has_permissions(manage_messages=True)
     async def bwlist(self, ctx):
-        """List all blocked words."""
         c.execute("SELECT word FROM block_words WHERE guild_id = ?", (ctx.guild.id,))
         words = [r[0] for r in c.fetchall()]
         await ctx.send(f"Blocked Words: {', '.join(words)}")
@@ -330,12 +318,11 @@ class ModCog(commands.Cog):
     @commands.has_permissions(manage_channels=True)
     async def set_slowmode(self, ctx, seconds: int):
         await ctx.channel.edit(slowmode_delay=seconds)
-        await ctx.send(f"🐢 Slowmode set to {seconds}s")
+        await ctx.send(f"🐢 Slowmode: {seconds}s")
 
     @commands.hybrid_command()
     @commands.has_permissions(manage_messages=True)
     async def note(self, ctx, member: discord.Member, *, content: str):
-        """Add a note to a user."""
         c.execute("INSERT INTO notes (user_id, guild_id, note, author_id) VALUES (?, ?, ?, ?)",
                   (member.id, ctx.guild.id, content, ctx.author.id))
         conn.commit()
@@ -343,22 +330,21 @@ class ModCog(commands.Cog):
 
     @commands.hybrid_command()
     @commands.has_permissions(manage_messages=True)
-    async def user_notes(self, ctx, member: discord.Member):
-        """View notes for a user."""
+    async def view_notes(self, ctx, member: discord.Member):
         c.execute("SELECT id, note FROM notes WHERE user_id = ? AND guild_id = ?", (member.id, ctx.guild.id))
         notes = c.fetchall()
         if not notes:
             await ctx.send("No notes found.")
             return
-        msg = f"**Notes for {member.name}:**\n"
-        for nid, ntext in notes:
-            msg += f"ID {nid}: {ntext}\n"
-        await ctx.send(msg)
+        t = f"**Notes for {member.name}**\n"
+        for nid, txt in notes:
+            t += f"`ID {nid}`: {txt}\n"
+        await ctx.send(t)
 
     @commands.hybrid_command()
     @commands.has_permissions(manage_roles=True)
     async def temp_role(self, ctx, member: discord.Member, role: discord.Role, minutes: int):
-        """Give a role temporarily."""
+        """Assign a temporary role."""
         await member.add_roles(role)
         expiry = datetime.datetime.now().timestamp() + (minutes * 60)
         c.execute("INSERT INTO temp_roles (user_id, guild_id, role_id, expiry_timestamp) VALUES (?, ?, ?, ?)",
@@ -370,7 +356,7 @@ class ModCog(commands.Cog):
     @commands.has_permissions(manage_nicknames=True)
     async def set_nick(self, ctx, member: discord.Member, nick: str):
         await member.edit(nick=nick)
-        await ctx.send(f"✅ Nickname changed.")
+        await ctx.send(f"✅ Nickname updated.")
 
 class UtilCog(commands.Cog):
     def __init__(self, bot):
@@ -378,8 +364,7 @@ class UtilCog(commands.Cog):
 
     @commands.hybrid_command()
     async def help(self, ctx):
-        embed = discord.Embed(title="Bot Help", description="Use `/` for commands.", color=discord.Color.gold())
-        embed.add_field(name="Modules", value="Admin, Moderation, Utility, Premium")
+        embed = discord.Embed(title="Bot Help", description="Features: Admin, Mod, Tickets, Utility, Premium.", color=discord.Color.gold())
         await ctx.send(embed=embed)
 
     @commands.hybrid_command()
@@ -391,7 +376,7 @@ class UtilCog(commands.Cog):
 
     @commands.hybrid_command()
     async def membercount(self, ctx):
-        await ctx.send(f"📊 Members: {ctx.guild.member_count}")
+        await ctx.send(f"📊 {ctx.guild.member_count} Members")
 
     @commands.hybrid_command()
     async def userinfo(self, ctx, member: discord.Member = None):
@@ -407,21 +392,20 @@ class UtilCog(commands.Cog):
         if ctx.guild.banner:
             await ctx.send(ctx.guild.banner.url)
         else:
-            await ctx.send("Server has no banner.")
+            await ctx.send("No banner set.")
 
     @commands.hybrid_command()
     async def roleinfo(self, ctx, role: discord.Role):
-        await ctx.send(f"**Role**: {role.name}\n**ID**: {role.id}\n**Members**: {len(role.members)}")
+        await ctx.send(f"**{role.name}**\nID: {role.id}\nMembers: {len(role.members)}")
 
-    @commands.hybrid_command()
-    async def botinvite(self, ctx):
-        await ctx.send(f"🔗 Invite Me: {discord.utils.oauth_url(self.bot.user.id)}")
+    @commands.hybrid_command(name="botinvite")
+    async def bot_invite_link(self, ctx):
+        # Method renamed to avoid 'bot_' start conflict, command name preserved
+        await ctx.send(f"🔗 Invite: {discord.utils.oauth_url(self.bot.user.id)}")
 
     @commands.hybrid_command()
     async def channel_stats(self, ctx):
-        t = len(ctx.guild.text_channels)
-        v = len(ctx.guild.voice_channels)
-        await ctx.send(f"📺 **Stats**\nText Channels: {t}\nVoice Channels: {v}")
+        await ctx.send(f"Text: {len(ctx.guild.text_channels)} | Voice: {len(ctx.guild.voice_channels)}")
 
     @commands.hybrid_command()
     async def afk(self, ctx, *, reason="AFK"):
@@ -435,27 +419,24 @@ class UtilCog(commands.Cog):
     @commands.hybrid_command()
     async def poll(self, ctx, question: str, option1: str, option2: str):
         embed = discord.Embed(title="Poll", description=question, color=discord.Color.gold())
-        embed.add_field(name="Option 1", value=option1)
-        embed.add_field(name="Option 2", value=option2)
-        msg = await ctx.send(embed=embed)
-        await msg.add_reaction("1️⃣")
-        await msg.add_reaction("2️⃣")
+        embed.add_field(name="1", value=option1)
+        embed.add_field(name="2", value=option2)
+        m = await ctx.send(embed=embed)
+        await m.add_reaction("1️⃣")
+        await m.add_reaction("2️⃣")
 
     @commands.hybrid_command()
     async def giveaway(self, ctx, seconds: int, prize: str):
-        """Start a quick giveaway."""
-        embed = discord.Embed(title="🎉 Giveaway!", description=f"Prize: **{prize}**\nEnds in: {seconds}s")
+        embed = discord.Embed(title="🎉 Giveaway!", description=f"**{prize}**\nTime: {seconds}s")
         msg = await ctx.send(embed=embed)
         await msg.add_reaction("🎉")
         await asyncio.sleep(seconds)
         
-        new_msg = await ctx.channel.fetch_message(msg.id)
-        users = [u for u in new_msg.reactions[0].users if not u.bot] # This is a generator, so we need to iterate or use flattening if async
-        # Correct async iteration for reactions:
+        msg = await ctx.channel.fetch_message(msg.id)
         users = []
-        async for u in new_msg.reactions[0].users():
+        async for u in msg.reactions[0].users():
             if not u.bot: users.append(u)
-            
+        
         if users:
             winner = random.choice(users)
             await ctx.send(f"🎉 Winner: {winner.mention} won **{prize}**!")
@@ -464,17 +445,16 @@ class UtilCog(commands.Cog):
 
     @commands.hybrid_command()
     async def reaction_role(self, ctx, message_id: str, emoji: str, role: discord.Role):
-        """Bind a role to a reaction on a message."""
         try:
             mid = int(message_id)
             c.execute("INSERT INTO reaction_roles (message_id, emoji, role_id, guild_id) VALUES (?, ?, ?, ?)",
                       (mid, emoji, role.id, ctx.guild.id))
             conn.commit()
-            msg = await ctx.channel.fetch_message(mid)
-            await msg.add_reaction(emoji)
-            await ctx.send(f"✅ Reaction Role Set: {emoji} -> {role.name}")
-        except Exception as e:
-            await ctx.send(f"❌ Error: {e}")
+            m = await ctx.channel.fetch_message(mid)
+            await m.add_reaction(emoji)
+            await ctx.send(f"✅ Bound {emoji} to {role.name}")
+        except:
+            await ctx.send("❌ Error finding message.")
 
     @commands.hybrid_command()
     async def suggestion(self, ctx, *, content: str):
@@ -483,14 +463,14 @@ class UtilCog(commands.Cog):
         if res and res[0]:
             chan = ctx.guild.get_channel(res[0])
             if chan:
-                embed = discord.Embed(title="Suggestion", description=content)
-                embed.set_author(name=ctx.author.name, icon_url=ctx.author.display_avatar.url)
-                m = await chan.send(embed=embed)
+                e = discord.Embed(title="Suggestion", description=content)
+                e.set_author(name=ctx.author.name, icon_url=ctx.author.display_avatar.url)
+                m = await chan.send(embed=e)
                 await m.add_reaction("👍")
                 await m.add_reaction("👎")
-                await ctx.send("✅ Suggestion sent.")
+                await ctx.send("✅ Sent.")
         else:
-            await ctx.send("❌ Suggestion channel not configured.")
+            await ctx.send("❌ Channel not set.")
 
 class PremiumCog(commands.Cog):
     def __init__(self, bot):
@@ -499,45 +479,46 @@ class PremiumCog(commands.Cog):
     @commands.hybrid_command()
     @premium_only()
     async def change_nick(self, ctx, nick: str):
-        """(Premium) Change the bot's nickname."""
+        """(Premium) Change bot nickname."""
         await ctx.guild.me.edit(nick=nick)
-        await ctx.send(f"💎 Bot nickname changed to {nick}")
+        await ctx.send(f"💎 Nickname changed.")
 
     @commands.hybrid_command()
     @premium_only()
     async def invite_panel(self, ctx):
-        """(Premium) Show custom invite panel."""
-        embed = discord.Embed(title="Invite Us", description="Click to invite!", color=discord.Color.gold())
-        embed.set_image(url="https://dummyimage.com/400x100/000/fff&text=Invite+Banner")
-        await ctx.send(embed=embed)
+        """(Premium) Invite Panel."""
+        e = discord.Embed(title="Invite", description="Click to add me.", color=discord.Color.gold())
+        e.set_image(url="https://dummyimage.com/400x100/000/fff&text=Invite+Banner")
+        await ctx.send(embed=e)
 
     @commands.hybrid_command()
     @premium_only()
     async def anti_raid_pro(self, ctx, state: str):
-        """(Premium) Enable Pro Anti-Raid."""
+        """(Premium) Pro Anti-Raid."""
         val = 1 if state.lower() == "on" else 0
         c.execute("UPDATE guild_config SET anti_raid_pro = ? WHERE guild_id = ?", (val, ctx.guild.id))
         conn.commit()
         await ctx.send(f"💎 Anti-Raid Pro: {state.upper()}")
 
-    @commands.hybrid_command()
+    @commands.hybrid_command(name="bot_bio")
     @premium_only()
-    async def bot_bio(self, ctx, *, bio: str):
-        """(Premium) Set custom server bio."""
-        await ctx.send(f"💎 Server Bio updated: {bio}")
+    async def set_server_bio(self, ctx, *, bio: str):
+        """(Premium) Set server bio."""
+        # Renamed internal method 'bot_bio' to 'set_server_bio' to fix TypeError
+        await ctx.send(f"💎 Server Bio: {bio}")
 
     @commands.hybrid_command()
     @premium_only()
     async def spoiler_image(self, ctx, url: str):
-        """(Premium) Create spoiler link."""
+        """(Premium) Spoiler Image."""
         await ctx.send(f"💎 || {url} ||")
 
     @commands.hybrid_command()
     @premium_only()
     async def live_counter(self, ctx, channel: discord.VoiceChannel):
-        """(Premium) Set live member count channel."""
+        """(Premium) Live Member Counter."""
         await channel.edit(name=f"Members: {ctx.guild.member_count}")
-        await ctx.send(f"💎 Live counter active on {channel.name}")
+        await ctx.send(f"💎 Counter active on {channel.name}")
 
 class OwnerCog(commands.Cog):
     def __init__(self, bot):
@@ -546,16 +527,16 @@ class OwnerCog(commands.Cog):
     @commands.command()
     @commands.is_owner()
     async def gpremium(self, ctx, user: discord.User, days: int):
-        """Owner: Grant Premium (days=-1 for lifetime)."""
+        """Owner: Give Premium."""
         expiry = "never" if days == -1 else (datetime.datetime.now() + datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
         c.execute("INSERT OR REPLACE INTO premium (user_id, expiry, type) VALUES (?, ?, ?)", (user.id, expiry, "pro"))
         conn.commit()
-        await ctx.send(f"🌟 Premium given to {user.name} until {expiry}")
+        await ctx.send(f"🌟 Premium granted to {user.name}")
 
     @commands.command()
     @commands.is_owner()
     async def maintenance(self, ctx, state: str):
-        """Owner: Toggle Maintenance (on/off)."""
+        """Owner: Toggle Maintenance."""
         val = "1" if state.lower() == "on" else "0"
         c.execute("INSERT OR REPLACE INTO bot_config (key, value) VALUES ('maintenance', ?)", (val,))
         conn.commit()
@@ -566,14 +547,14 @@ class OwnerCog(commands.Cog):
     @commands.command()
     @commands.is_owner()
     async def node_list(self, ctx):
-        """Owner: System Status."""
+        """Owner: Check health."""
         lat = round(bot.latency * 1000)
-        await ctx.send(f"**Status**\nPing: {lat}ms\nOCR: {OCR_AVAILABLE}\nDB: OK\nOwner ID: {bot.owner_id}")
+        await ctx.send(f"**Status**\nPing: {lat}ms\nOCR: {OCR_AVAILABLE}\nDB: OK")
 
     @commands.command()
     @commands.is_owner()
     async def announce_update(self, ctx, *, msg):
-        """Owner: Global Announcement to all servers."""
+        """Owner: Broadcast update."""
         c.execute("SELECT announce_channel FROM guild_config")
         count = 0
         for row in c.fetchall():
@@ -585,27 +566,24 @@ class OwnerCog(commands.Cog):
                         count += 1
                 except: pass
         await ctx.send(f"Sent to {count} servers.")
-        
+
     @commands.command()
     @commands.is_owner()
     async def change_s(self, ctx, status_type: str):
-        """Owner: Change Status (online, idle, dnd)."""
-        s = discord.Status.online
-        if status_type == "idle": s = discord.Status.idle
-        elif status_type == "dnd": s = discord.Status.dnd
+        """Owner: Change Status (idle, dnd, online)."""
+        s = getattr(discord.Status, status_type, discord.Status.online)
         await self.bot.change_presence(status=s)
-        await ctx.send(f"Status changed to {status_type}")
+        await ctx.send(f"Status: {status_type}")
 
     @commands.command()
     @commands.is_owner()
     async def uptime(self, ctx):
-        await ctx.send("Bot is online and working.")
+        await ctx.send("Online.")
 
 # --- 7. TASKS & EVENTS ---
 
 @tasks.loop(minutes=1)
 async def task_check_temp_roles():
-    """Checks for expired temp roles."""
     now = datetime.datetime.now().timestamp()
     c.execute("SELECT user_id, guild_id, role_id FROM temp_roles WHERE expiry_timestamp < ?", (now,))
     rows = c.fetchall()
@@ -623,19 +601,17 @@ async def task_check_temp_roles():
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    print(f"Logged in as {bot.user}")
     task_check_temp_roles.start()
     bot.add_view(TicketView())
     bot.add_view(TicketControls())
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} commands.")
+        await bot.tree.sync()
     except Exception as e:
         print(f"Sync Error: {e}")
 
 @bot.event
 async def on_guild_role_create(role):
-    # Check Restricted Role Names
     c.execute("SELECT name FROM blocked_roles WHERE guild_id = ?", (role.guild.id,))
     blocked = [r[0] for r in c.fetchall()]
     if role.name.lower() in blocked:
@@ -644,17 +620,16 @@ async def on_guild_role_create(role):
 
 @bot.event
 async def on_member_join(member):
-    # Anti-Raid Logic
     c.execute("SELECT anti_raid, anti_raid_pro FROM guild_config WHERE guild_id = ?", (member.guild.id,))
     res = c.fetchone()
     if res:
         basic, pro = res
         age = (datetime.datetime.now(datetime.timezone.utc) - member.created_at).days
         if pro == 1 and age < 3:
-            try: await member.kick(reason="Anti-Raid Pro (Account too new)")
+            try: await member.kick(reason="Anti-Raid Pro")
             except: pass
         elif basic == 1 and age < 1:
-            try: await member.kick(reason="Anti-Raid Basic (Account too new)")
+            try: await member.kick(reason="Anti-Raid Basic")
             except: pass
 
 @bot.event
@@ -681,26 +656,24 @@ async def on_raw_reaction_remove(payload):
 async def on_message(message):
     if message.author.bot: return
 
-    # Mail Staff (Forward DM to Console/Log - Simulated)
+    # Mail
     if isinstance(message.channel, discord.DMChannel):
-        await message.channel.send("📧 Message received. Staff will review.")
-        print(f"DM from {message.author}: {message.content}")
+        await message.channel.send("📧 Staff Mail: Received.")
         return
 
-    # Maintenance Bypass Check
-    if is_maintenance_active() and message.author.id != bot.owner_id:
+    # Maintenance
+    if is_maintenance_mode() and message.author.id != bot.owner_id:
         return
 
-    # AFK Check (Is user back?)
+    # AFK
     c.execute("SELECT reason FROM afk WHERE user_id = ?", (message.author.id,))
     if c.fetchone():
         c.execute("DELETE FROM afk WHERE user_id = ?", (message.author.id,))
         conn.commit()
-        await message.channel.send(f"👋 Welcome back {message.author.mention}, AFK removed.", delete_after=5)
+        await message.channel.send(f"Welcome back {message.author.mention}, AFK removed.", delete_after=5)
         try: await message.author.edit(nick=None)
         except: pass
 
-    # AFK Check (Is mentioned user AFK?)
     if message.mentions:
         for m in message.mentions:
             c.execute("SELECT reason, timestamp FROM afk WHERE user_id = ?", (m.id,))
@@ -708,14 +681,14 @@ async def on_message(message):
             if res:
                 await message.channel.send(f"💤 {m.name} is AFK: {res[0]}", delete_after=5)
 
-    # Auto Mode (Link Spam)
+    # Auto Mode
     if "http" in message.content:
         c.execute("SELECT auto_mode FROM guild_config WHERE guild_id = ?", (message.guild.id,))
         res = c.fetchone()
         if res and res[0] == 1:
             if not message.author.guild_permissions.administrator:
                 await message.delete()
-                await message.channel.send("❌ Links blocked by Auto Mode.", delete_after=3)
+                await message.channel.send("❌ Links blocked.", delete_after=3)
 
     # Blocked Words
     c.execute("SELECT word FROM block_words WHERE guild_id = ?", (message.guild.id,))
@@ -724,7 +697,7 @@ async def on_message(message):
         await message.delete()
         await message.channel.send(f"⚠️ {message.author.mention} Word blocked!", delete_after=3)
 
-    # Crypto / Image Blocker (OCR)
+    # OCR
     if message.attachments and OCR_AVAILABLE:
         for att in message.attachments:
             if att.filename.lower().endswith(('.png', '.jpg', '.jpeg')):
@@ -735,13 +708,13 @@ async def on_message(message):
                     bad = ['crypto', 'bitcoin', 'investment', 'promo', 'dm me']
                     if any(b in text for b in bad):
                         await message.delete()
-                        await message.channel.send("🚫 Image blocked (Crypto/Spam detected).")
+                        await message.channel.send("🚫 Image blocked (Crypto/Spam).")
                         await message.author.timeout(datetime.timedelta(minutes=10))
                 except: pass
 
     await bot.process_commands(message)
 
-# --- 8. ENTRY POINT ---
+# --- 8. RUN ---
 
 async def main():
     await bot.add_cog(AdminCog(bot))
@@ -750,10 +723,10 @@ async def main():
     await bot.add_cog(PremiumCog(bot))
     await bot.add_cog(OwnerCog(bot))
     
-    keep_alive() # Start Flask Web Server
+    keep_alive() # Web Server
     
     if not TOKEN:
-        print("❌ Error: DISCORD_TOKEN is missing in .env")
+        print("❌ Error: DISCORD_TOKEN missing in .env")
         return
     await bot.start(TOKEN)
 
@@ -761,4 +734,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Bot Shutting Down.")
+        print("Bot Stopped.")
