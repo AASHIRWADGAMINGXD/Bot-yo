@@ -1,600 +1,505 @@
-import discord
-from discord import app_commands
-from discord.ext import commands, tasks
-from discord.ui import View, Button
 import os
-import json
+import logging
 import asyncio
-import datetime
-import time
-import io
 import random
-from flask import Flask
+import string
+import httpx
 from threading import Thread
 from dotenv import load_dotenv
 
-# --- CONFIGURATION ---
+from pyrogram import Client, filters, enums, idle
+from pyrogram.errors import UserNotParticipant, FloodWait
+from pyrogram.types import (
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup, 
+    Message, 
+    CallbackQuery,
+    ChatPrivileges
+)
+from pymongo import MongoClient
+from flask import Flask
+
+# --- Basic Logging ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# --- Load Environment Variables ---
 load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", 0))
 
-# --- DATABASE SYSTEM ---
-class Database:
-    def __init__(self, file="bot_data.json"):
-        self.file = file
-        self.data = self.load()
+# --- Configuration ---
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+MONGO_URI = os.environ.get("MONGO_URI", "")
+LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", 0)) 
+UPDATE_CHANNEL = os.environ.get("UPDATE_CHANNEL", "") 
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASS", "BhaiKaSystem")
+FIREBASE_URL = os.environ.get("FIREBASE_URL", "https://pain-bot-database-default-rtdb.firebaseio.com")
 
-    def load(self):
-        if not os.path.exists(self.file):
-            return {
-                "config": {
-                    "maintenance": [], "modmail_channel": None, "sugg_channel": None,
-                    "automod_links": False, "antiraid": False, "log_channel": None
-                },
-                "blocklist": [],
-                "blocked_roles": [],
-                "users": {}, # notes, warns, afk
-                "premium": {}, # user_id: expiry_timestamp
-                "tickets": {"count": 0, "category": None, "admin_role": None},
-                "admins": [],
-                "counters": {}, # channel_id: type
-                "reaction_roles": {}, # msg_id: {emoji: role_id}
-                "bot_bio": "System Active",
-                "join_log": []
-            }
-        try:
-            with open(self.file, "r") as f:
-                return json.load(f)
-        except:
-            return {}
+ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "")
+ADMINS = [int(admin_id.strip()) for admin_id in ADMIN_IDS_STR.split(',') if admin_id.strip().lstrip('-').isdigit()]
 
-    def save(self):
-        with open(self.file, "w") as f:
-            json.dump(self.data, f, indent=4)
+# --- Flask Web Server (24/7 Keep Alive) ---
+flask_app = Flask(__name__)
 
-db = Database()
+@flask_app.route('/')
+def index():
+    return "🚀 Combined System Bot is alive and running 24/7!", 200
 
-# --- WEB SERVER (Keep Alive) ---
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot is Online and Healthy!"
-
-def run_server():
-    app.run(host='0.0.0.0', port=8080)
+def run_flask():
+    port = int(os.environ.get('PORT', 8080))
+    import logging as flask_logging
+    flask_logging.getLogger('werkzeug').setLevel(flask_logging.ERROR)
+    flask_app.run(host='0.0.0.0', port=port, use_reloader=False)
 
 def keep_alive():
-    t = Thread(target=run_server)
-    t.start()
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info("✅ Flask Keep-Alive Server Started!")
 
-# --- BOT CLASS ---
-class ProfessionalBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.all()
-        super().__init__(command_prefix="!", intents=intents, help_command=None)
-        self.start_time = time.time()
+# --- Databases Setup (Mongo & Firebase Sync) ---
+try:
+    client_db = MongoClient(MONGO_URI)
+    db = client_db['file_link_bot']
+    files_collection = db['files']
+    settings_collection = db['settings']
+    logger.info("✅ MongoDB Connected Successfully!")
+except Exception as e:
+    logger.error(f"❌ Error connecting to MongoDB: {e}")
+    exit(1)
 
-    async def setup_hook(self):
-        self.counter_loop.start()
-        keep_alive()
-        # Register persistent views so buttons work after restart
-        self.add_view(TicketLauncher())
-        
-    async def on_ready(self):
-        print(f"✅ Logged in as {self.user}")
-        print("🔄 Syncing Slash Commands...")
-        try:
-            synced = await self.tree.sync()
-            print(f"✅ Synced {len(synced)} commands.")
-        except Exception as e:
-            print(f"❌ Sync Error: {e}")
-        await self.change_presence(activity=discord.Game(name=db.data["bot_bio"]))
+# In-Memory & Firebase Vars
+authorized_users = set()  
+warns = {}                
+afk_users = {}            
+auto_replies = {}         
+restricted_words = set()  
 
-    @tasks.loop(minutes=10)
-    async def counter_loop(self):
-        # Updates the names of "Counter" channels
-        for channel_id, c_type in list(db.data["counters"].items()):
-            try:
-                channel = self.get_channel(int(channel_id))
-                if channel:
-                    count = 0
-                    if c_type == "members": count = channel.guild.member_count
-                    elif c_type == "bots": count = sum(1 for m in channel.guild.members if m.bot)
-                    elif c_type == "banned": 
-                        try: count = len([entry async for entry in channel.guild.bans()])
-                        except: pass
-                    await channel.edit(name=f"{c_type.title()}: {count}")
-            except:
-                continue
+async def fb_put(path: str, data):
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.put(f"{FIREBASE_URL}/{path}.json", json=data)
+    except Exception as e:
+        logger.error(f"Failed to put data in Firebase: {e}")
 
-client = ProfessionalBot()
+async def fb_delete(path: str):
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.delete(f"{FIREBASE_URL}/{path}.json")
+    except Exception as e:
+        logger.error(f"Failed to delete data from Firebase: {e}")
 
-# --- HELPER CHECKS ---
-def is_bot_admin(interaction: discord.Interaction):
-    return interaction.user.id == OWNER_ID or interaction.user.id in db.data["admins"] or interaction.user.guild_permissions.administrator
+async def load_firebase_data():
+    global auto_replies, afk_users, restricted_words
+    try:
+        async with httpx.AsyncClient() as client:
+            res1 = await client.get(f"{FIREBASE_URL}/autoreplies.json")
+            if res1.status_code == 200 and res1.json(): auto_replies = res1.json()
+            
+            res2 = await client.get(f"{FIREBASE_URL}/afk.json")
+            if res2.status_code == 200 and res2.json(): afk_users = res2.json()
+                
+            res3 = await client.get(f"{FIREBASE_URL}/restricted.json")
+            if res3.status_code == 200 and res3.json(): restricted_words = set(res3.json().keys())
+                
+        logger.info("✅ Firebase Data Loaded Successfully!")
+    except Exception as e:
+        logger.error(f"❌ Failed to load Firebase data: {e}")
 
-def is_premium(interaction: discord.Interaction):
-    if interaction.user.id == OWNER_ID: return True
-    uid = str(interaction.user.id)
-    if uid in db.data["premium"]:
-        expiry = db.data["premium"][uid]
-        if expiry == "never" or float(expiry) > time.time(): return True
+# --- Pyrogram Client ---
+app = Client("SystemBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# --- Helpers ---
+def generate_random_string(length=6):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+async def is_user_member(client: Client, user_id: int) -> bool:
+    if not UPDATE_CHANNEL: return True 
+    try:
+        channel = int(UPDATE_CHANNEL) if UPDATE_CHANNEL.lstrip('-').isdigit() else UPDATE_CHANNEL
+        if isinstance(channel, str) and not channel.startswith('@'):
+            channel = f"@{channel}"
+        await client.get_chat_member(chat_id=channel, user_id=user_id)
+        return True
+    except UserNotParticipant: return False
+    except Exception: return False
+
+async def get_bot_mode() -> str:
+    setting = settings_collection.find_one({"_id": "bot_mode"})
+    if setting: return setting.get("mode", "public")
+    settings_collection.update_one({"_id": "bot_mode"}, {"$set": {"mode": "public"}}, upsert=True)
+    return "public"
+
+async def is_admin(message: Message) -> bool:
+    user_id = message.from_user.id
+    if user_id in ADMINS or user_id in authorized_users: return True
+    if message.chat.type == enums.ChatType.PRIVATE: return True
+    
+    try:
+        member = await app.get_chat_member(message.chat.id, user_id)
+        if member.status in [enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER]:
+            return True
+    except Exception: pass
     return False
 
-# --- TICKET VIEWS ---
-class TicketControl(View):
-    def __init__(self):
-        super().__init__(timeout=None)
+# ==========================================
+# ============ 1. FILE & LINK FEATURES =====
+# ==========================================
 
-    @discord.ui.button(label="Close", style=discord.ButtonStyle.red, emoji="🔒", custom_id="tkt_close")
-    async def close_ticket(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.send_message("Ticket closing in 5 seconds...")
-        await asyncio.sleep(5)
-        await interaction.channel.delete()
-
-    @discord.ui.button(label="Transcript", style=discord.ButtonStyle.blurple, emoji="📄", custom_id="tkt_trans")
-    async def transcript(self, interaction: discord.Interaction, button: Button):
-        await interaction.response.defer()
-        messages = [f"{m.created_at} - {m.author}: {m.content}" async for m in interaction.channel.history(limit=None, oldest_first=True)]
-        output = "\n".join(messages)
-        file = discord.File(io.BytesIO(output.encode()), filename=f"transcript-{interaction.channel.name}.txt")
-        await interaction.followup.send("Transcript generated:", file=file)
-
-class TicketLauncher(View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Open Ticket", style=discord.ButtonStyle.green, emoji="📩", custom_id="tkt_open")
-    async def create_ticket(self, interaction: discord.Interaction, button: Button):
-        db.data["tickets"]["count"] += 1
-        db.save()
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(client: Client, message: Message):
+    if len(message.command) > 1:
+        file_id_str = message.command[1]
         
-        t_name = f"ticket-{db.data['tickets']['count']}"
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            interaction.user: discord.PermissionOverwrite(read_messages=True),
-            interaction.guild.me: discord.PermissionOverwrite(read_messages=True)
-        }
-        
-        # Add Admin Role permissions if set
-        if db.data["tickets"]["admin_role"]:
-            role = interaction.guild.get_role(db.data["tickets"]["admin_role"])
-            if role: overwrites[role] = discord.PermissionOverwrite(read_messages=True)
+        if not await is_user_member(client, message.from_user.id):
+            clean_channel = UPDATE_CHANNEL.replace('@', '')
+            join_button = InlineKeyboardButton("🔗 Join Channel", url=f"https://t.me/{clean_channel}")
+            joined_button = InlineKeyboardButton("✅ I Have Joined", callback_data=f"check_join_{file_id_str}")
+            keyboard = InlineKeyboardMarkup([[join_button], [joined_button]])
+            return await message.reply(
+                f"👋 **Hello, {message.from_user.first_name}!**\n\nYe file access karne ke liye, aapko hamara update channel join karna hoga.",
+                reply_markup=keyboard
+            )
 
-        category = interaction.guild.get_channel(db.data["tickets"]["category"]) if db.data["tickets"]["category"] else None
-        
-        try:
-            channel = await interaction.guild.create_text_channel(t_name, category=category, overwrites=overwrites)
-            embed = discord.Embed(title="Support Ticket", description=f"Welcome {interaction.user.mention}. Describe your issue.", color=discord.Color.green())
-            await channel.send(embed=embed, view=TicketControl())
-            await interaction.response.send_message(f"Ticket opened: {channel.mention}", ephemeral=True)
-        except Exception as e:
-            await interaction.response.send_message(f"Error creating channel: {e}", ephemeral=True)
-
-# --- EVENTS & AUTOMOD ---
-@client.event
-async def on_message(message):
-    if message.author.bot: return
-
-    # 1. Modmail (DM to Server)
-    if isinstance(message.channel, discord.DMChannel):
-        if db.data["config"]["modmail_channel"]:
-            for guild in client.guilds:
-                chan = guild.get_channel(db.data["config"]["modmail_channel"])
-                if chan:
-                    embed = discord.Embed(title="📨 Modmail", description=message.content, color=discord.Color.blue())
-                    embed.set_author(name=message.author, icon_url=message.author.display_avatar)
-                    embed.set_footer(text=f"ID: {message.author.id}")
-                    await chan.send(embed=embed)
-                    await message.add_reaction("✅")
-                    return
-
-    # 2. AFK Check
-    if message.mentions:
-        for user in message.mentions:
-            uid = str(user.id)
-            if uid in db.data["users"] and "afk" in db.data["users"][uid]:
-                await message.channel.send(f"💤 **{user.name}** is AFK: {db.data['users'][uid]['afk']}", delete_after=5)
-
-    # 3. Blocked Words (AutoMod)
-    # The fix: Ensure this logic DOES NOT run on interactions/slash commands
-    if not message.content.startswith("/"):
-        content = message.content.lower()
-        for word in db.data["blocklist"]:
-            if word in content:
-                try:
-                    await message.delete()
-                    await message.channel.send(f"⚠️ {message.author.mention}, that word is not allowed.", delete_after=3)
-                    return # Stop processing
-                except: pass
-
-    # 4. Link Spam
-    if db.data["config"]["automod_links"] and ("http://" in message.content or "https://" in message.content):
-        if not message.author.guild_permissions.administrator:
-            await message.delete()
-            await message.channel.send("⚠️ No links allowed.", delete_after=3)
-            return
-            
-    # 5. Crypto/Promo Image Check
-    if message.attachments:
-        for att in message.attachments:
-            fname = att.filename.lower()
-            if "promo" in fname or "crypto" in fname or "pump" in fname:
-                await message.delete()
-                await message.channel.send("⚠️ Suspicious image detected.", delete_after=3)
-
-@client.event
-async def on_member_join(member):
-    if db.data["config"]["antiraid"]:
-        now = time.time()
-        db.data["join_log"].append(now)
-        # Keep logs only from last 10s
-        db.data["join_log"] = [t for t in db.data["join_log"] if now - t < 10]
-        db.save()
-        
-        if len(db.data["join_log"]) > 5:
-            try: await member.kick(reason="Anti-Raid Protection")
-            except: pass
-
-@client.event
-async def on_raw_reaction_add(payload):
-    if payload.user_id == client.user.id: return
-    msg_id = str(payload.message_id)
-    if msg_id in db.data["reaction_roles"]:
-        emoji = str(payload.emoji)
-        if emoji in db.data["reaction_roles"][msg_id]:
-            guild = client.get_guild(payload.guild_id)
-            role = guild.get_role(db.data["reaction_roles"][msg_id][emoji])
-            member = guild.get_member(payload.user_id)
-            if role and member: await member.add_roles(role)
-
-@client.event
-async def on_guild_role_create(role):
-    if role.name in db.data["blocked_roles"]:
-        try: await role.delete(reason="Blocked Role Name")
-        except: pass
-
-# --- SLASH COMMAND GROUPS ---
-
-# 1. MODERATION
-class Moderation(app_commands.Group):
-    def __init__(self):
-        super().__init__(name="mod", description="Moderation commands")
-
-    @app_commands.command(description="Ban a user")
-    @app_commands.checks.has_permissions(ban_members=True)
-    async def ban(self, interaction: discord.Interaction, user: discord.Member, reason: str = "None"):
-        await user.ban(reason=reason)
-        await interaction.response.send_message(f"🔨 Banned {user.name}")
-
-    @app_commands.command(description="Kick a user")
-    @app_commands.checks.has_permissions(kick_members=True)
-    async def kick(self, interaction: discord.Interaction, user: discord.Member, reason: str = "None"):
-        await user.kick(reason=reason)
-        await interaction.response.send_message(f"👢 Kicked {user.name}")
-
-    @app_commands.command(description="Timeout a user")
-    @app_commands.checks.has_permissions(moderate_members=True)
-    async def mute(self, interaction: discord.Interaction, user: discord.Member, minutes: int, reason: str = "None"):
-        await user.timeout(datetime.timedelta(minutes=minutes), reason=reason)
-        await interaction.response.send_message(f"😶 Muted {user.name} for {minutes}m")
-
-    @app_commands.command(description="Warn a user")
-    @app_commands.checks.has_permissions(manage_messages=True)
-    async def warn(self, interaction: discord.Interaction, user: discord.Member, reason: str):
-        uid = str(user.id)
-        if uid not in db.data["users"]: db.data["users"][uid] = {}
-        if "warns" not in db.data["users"][uid]: db.data["users"][uid]["warns"] = []
-        db.data["users"][uid]["warns"].append(f"{reason} - {interaction.user.name}")
-        db.save()
-        await interaction.response.send_message(f"⚠️ Warned {user.name}")
-
-    @app_commands.command(description="Block a word (Fixes auto-deletion bug)")
-    @app_commands.checks.has_permissions(manage_messages=True)
-    async def blockword(self, interaction: discord.Interaction, word: str):
-        if word.lower() not in db.data["blocklist"]:
-            db.data["blocklist"].append(word.lower())
-            db.save()
-            await interaction.response.send_message(f"🚫 Blocked: `{word}`")
+        file_record = files_collection.find_one({"_id": file_id_str})
+        if file_record:
+            try:
+                await client.copy_message(chat_id=message.from_user.id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
+            except Exception as e:
+                await message.reply(f"❌ Sorry, file bhejte waqt error aa gaya.\n`Error: {e}`")
         else:
-            await interaction.response.send_message("Already blocked.")
-
-    @app_commands.command(description="Unblock a word")
-    @app_commands.checks.has_permissions(manage_messages=True)
-    async def unblockword(self, interaction: discord.Interaction, word: str):
-        if word.lower() in db.data["blocklist"]:
-            db.data["blocklist"].remove(word.lower())
-            db.save()
-            await interaction.response.send_message(f"✅ Unblocked: `{word}`")
-        else:
-            await interaction.response.send_message("Word not found.")
-
-    @app_commands.command(description="See all blocked words")
-    async def blocklist(self, interaction: discord.Interaction):
-        await interaction.response.send_message(f"Blocked: {', '.join(db.data['blocklist'])}", ephemeral=True)
-
-    @app_commands.command(description="Restrict specific role name creation")
-    @app_commands.checks.has_permissions(manage_roles=True)
-    async def block_role_name(self, interaction: discord.Interaction, name: str):
-        db.data["blocked_roles"].append(name)
-        db.save()
-        await interaction.response.send_message(f"🚫 Role name restricted: {name}")
-
-    @app_commands.command(description="Set Slowmode")
-    @app_commands.checks.has_permissions(manage_channels=True)
-    async def slowmode(self, interaction: discord.Interaction, seconds: int):
-        await interaction.channel.edit(slowmode_delay=seconds)
-        await interaction.response.send_message(f"Slowmode: {seconds}s")
-
-    @app_commands.command(description="Toggle Automod (Links)")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def automod(self, interaction: discord.Interaction, enabled: bool):
-        db.data["config"]["automod_links"] = enabled
-        db.save()
-        await interaction.response.send_message(f"Link Automod: {enabled}")
-
-    @app_commands.command(description="Toggle Anti-Raid")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def antiraid(self, interaction: discord.Interaction, enabled: bool):
-        db.data["config"]["antiraid"] = enabled
-        db.save()
-        await interaction.response.send_message(f"Anti-Raid: {enabled}")
-
-client.tree.add_command(Moderation())
-
-# 2. ADMIN & TICKETS
-class Admin(app_commands.Group):
-    def __init__(self):
-        super().__init__(name="admin", description="Admin commands")
-
-    @app_commands.command(description="Setup Ticket Panel")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def setup_ticket(self, interaction: discord.Interaction):
-        embed = discord.Embed(title="Support", description="Click below to open a ticket.", color=discord.Color.blue())
-        await interaction.channel.send(embed=embed, view=TicketLauncher())
-        await interaction.response.send_message("Done.", ephemeral=True)
-
-    @app_commands.command(description="Set Ticket Admin Role")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def ticket_role(self, interaction: discord.Interaction, role: discord.Role):
-        db.data["tickets"]["admin_role"] = role.id
-        db.save()
-        await interaction.response.send_message(f"Ticket Admin Role: {role.name}")
-
-    @app_commands.command(description="Set Modmail Channel")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def set_modmail(self, interaction: discord.Interaction):
-        db.data["config"]["modmail_channel"] = interaction.channel_id
-        db.save()
-        await interaction.response.send_message("Modmail channel set here.")
-
-    @app_commands.command(description="Set Suggestion Channel")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def set_suggestions(self, interaction: discord.Interaction):
-        db.data["config"]["sugg_channel"] = interaction.channel_id
-        db.save()
-        await interaction.response.send_message("Suggestion channel set here.")
-    
-    @app_commands.command(description="Add Bot Admin (Owner Only)")
-    async def add_bot_admin(self, interaction: discord.Interaction, user: discord.User):
-        if interaction.user.id != OWNER_ID:
-            return await interaction.response.send_message("Owner only.", ephemeral=True)
-        if user.id not in db.data["admins"]:
-            db.data["admins"].append(user.id)
-            db.save()
-            await interaction.response.send_message(f"Added {user.name} to admins.")
-
-    @app_commands.command(description="Grant Premium")
-    async def gpremium(self, interaction: discord.Interaction, user: discord.User, days: int):
-        if interaction.user.id != OWNER_ID: return await interaction.response.send_message("Owner only.", ephemeral=True)
-        expiry = time.time() + (days * 86400) if days > 0 else "never"
-        db.data["premium"][str(user.id)] = expiry
-        db.save()
-        await interaction.response.send_message(f"💎 Premium granted to {user.name}")
-
-    @app_commands.command(description="Create Live Counter Channel")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def create_counter(self, interaction: discord.Interaction, type: str):
-        if type not in ["members", "bots", "banned"]:
-            return await interaction.response.send_message("Invalid type. Use: members, bots, or banned")
-        
-        vc = await interaction.guild.create_voice_channel(f"{type.title()}: Loading...")
-        db.data["counters"][str(vc.id)] = type
-        db.save()
-        await interaction.response.send_message(f"Counter created: {vc.name}")
-
-    @app_commands.command(description="Set Bot Status")
-    async def bot_status(self, interaction: discord.Interaction, text: str):
-        if not is_bot_admin(interaction): return await interaction.response.send_message("No permission.", ephemeral=True)
-        db.data["bot_bio"] = text
-        db.save()
-        await client.change_presence(activity=discord.Game(name=text))
-        await interaction.response.send_message("Updated.")
-    
-    @app_commands.command(description="Reaction Role Setup")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def reaction_role(self, interaction: discord.Interaction, message_id: str, emoji: str, role: discord.Role):
-        if message_id not in db.data["reaction_roles"]: db.data["reaction_roles"][message_id] = {}
-        db.data["reaction_roles"][message_id][emoji] = role.id
-        db.save()
-        msg = await interaction.channel.fetch_message(int(message_id))
-        await msg.add_reaction(emoji)
-        await interaction.response.send_message("Reaction role set.")
-
-client.tree.add_command(Admin())
-
-# 3. UTILITY & DM COMMAND
-class Utility(app_commands.Group):
-    def __init__(self):
-        super().__init__(name="utils", description="Utility commands")
-
-    # --- THE REQUESTED DM COMMAND ---
-    @app_commands.command(description="Send DM to User")
-    async def dm(self, interaction: discord.Interaction, user: discord.User, message: str):
-        # Only admins should use this to prevent spam
-        if not is_bot_admin(interaction): 
-            return await interaction.response.send_message("Admin only.", ephemeral=True)
-        try:
-            await user.send(f"**Message from {interaction.guild.name} Staff:**\n{message}")
-            await interaction.response.send_message("✅ Sent.", ephemeral=True)
-        except:
-            await interaction.response.send_message("❌ Failed (User has DMs closed).", ephemeral=True)
-
-    @app_commands.command(description="Show Avatar")
-    async def avatar(self, interaction: discord.Interaction, user: discord.User = None):
-        user = user or interaction.user
-        await interaction.response.send_message(embed=discord.Embed().set_image(url=user.display_avatar.url))
-
-    @app_commands.command(description="Show Banner")
-    async def banner(self, interaction: discord.Interaction, user: discord.User = None):
-        user = user or interaction.user
-        fetched = await client.fetch_user(user.id)
-        if fetched.banner:
-            await interaction.response.send_message(embed=discord.Embed().set_image(url=fetched.banner.url))
-        else:
-            await interaction.response.send_message("No banner.", ephemeral=True)
-
-    @app_commands.command(description="Member Count")
-    async def membercount(self, interaction: discord.Interaction):
-        await interaction.response.send_message(f"Members: {interaction.guild.member_count}")
-
-    @app_commands.command(description="Create Poll")
-    async def poll(self, interaction: discord.Interaction, question: str):
-        embed = discord.Embed(title="Poll", description=question, color=discord.Color.gold())
-        await interaction.response.send_message("Poll created.")
-        msg = await interaction.channel.send(embed=embed)
-        await msg.add_reaction("👍")
-        await msg.add_reaction("👎")
-
-    @app_commands.command(description="Giveaway")
-    async def giveaway(self, interaction: discord.Interaction, duration: str, prize: str):
-        # Parses 10m, 10s
-        unit = duration[-1]
-        try:
-            val = int(duration[:-1])
-            secs = val * 60 if unit == "m" else val
-        except:
-            return await interaction.response.send_message("Format: 10s or 5m")
-
-        embed = discord.Embed(title="🎉 Giveaway", description=f"Prize: **{prize}**\nReact with 🎉", color=discord.Color.purple())
-        await interaction.response.send_message("Giveaway started!")
-        msg = await interaction.channel.send(embed=embed)
-        await msg.add_reaction("🎉")
-        
-        await asyncio.sleep(secs)
-        
-        msg = await interaction.channel.fetch_message(msg.id)
-        users = [u async for u in msg.reactions[0].users() if not u.bot]
-        if users:
-            winner = random.choice(users)
-            await interaction.channel.send(f"🎉 Winner: {winner.mention} won **{prize}**!")
-        else:
-            await interaction.channel.send("No entries.")
-
-    @app_commands.command(description="Submit Suggestion")
-    async def suggestion(self, interaction: discord.Interaction, content: str):
-        cid = db.data["config"]["sugg_channel"]
-        if not cid: return await interaction.response.send_message("Suggestion channel not set.", ephemeral=True)
-        chan = client.get_channel(cid)
-        embed = discord.Embed(description=content, title="New Suggestion", color=discord.Color.orange())
-        embed.set_author(name=interaction.user.name, icon_url=interaction.user.display_avatar.url)
-        msg = await chan.send(embed=embed)
-        await msg.add_reaction("✅")
-        await msg.add_reaction("❌")
-        await interaction.response.send_message("Sent.", ephemeral=True)
-
-    @app_commands.command(description="Set User Nickname")
-    @app_commands.checks.has_permissions(manage_nicknames=True)
-    async def setnick(self, interaction: discord.Interaction, user: discord.Member, nick: str):
-        await user.edit(nick=nick)
-        await interaction.response.send_message(f"Changed to {nick}")
-
-    @app_commands.command(description="Set Role to User")
-    @app_commands.checks.has_permissions(manage_roles=True)
-    async def setrole(self, interaction: discord.Interaction, user: discord.Member, role: discord.Role):
-        await user.add_roles(role)
-        await interaction.response.send_message(f"Added {role.name}")
-
-    @app_commands.command(description="Set Note")
-    async def note(self, interaction: discord.Interaction, user: discord.User, content: str):
-        if not is_bot_admin(interaction): return
-        uid = str(user.id)
-        if uid not in db.data["users"]: db.data["users"][uid] = {}
-        if "notes" not in db.data["users"][uid]: db.data["users"][uid]["notes"] = []
-        db.data["users"][uid]["notes"].append(content)
-        db.save()
-        await interaction.response.send_message("Note saved.")
-
-    @app_commands.command(description="Read Notes")
-    async def read_notes(self, interaction: discord.Interaction, user: discord.User):
-        if not is_bot_admin(interaction): return
-        uid = str(user.id)
-        notes = db.data["users"].get(uid, {}).get("notes", ["None"])
-        await interaction.response.send_message(f"Notes: {notes}", ephemeral=True)
-
-    @app_commands.command(description="Set AFK")
-    async def afk(self, interaction: discord.Interaction, message: str = "AFK"):
-        uid = str(interaction.user.id)
-        if uid not in db.data["users"]: db.data["users"][uid] = {}
-        db.data["users"][uid]["afk"] = message
-        db.save()
-        await interaction.response.send_message(f"Set AFK: {message}", ephemeral=True)
-
-    @app_commands.command(description="User Info")
-    async def userinfo(self, interaction: discord.Interaction, user: discord.Member = None):
-        user = user or interaction.user
-        embed = discord.Embed(title=user.name)
-        embed.add_field(name="ID", value=user.id)
-        embed.add_field(name="Joined", value=user.joined_at.strftime("%Y-%m-%d"))
-        await interaction.response.send_message(embed=embed)
-        
-    @app_commands.command(description="Uptime")
-    async def uptime(self, interaction: discord.Interaction):
-        up = time.time() - client.start_time
-        await interaction.response.send_message(f"Uptime: {int(up)} seconds")
-
-client.tree.add_command(Utility())
-
-# 4. PREMIUM
-class Premium(app_commands.Group):
-    def __init__(self):
-        super().__init__(name="premium", description="Premium commands")
-
-    @app_commands.command(description="Change Bot Nickname")
-    async def bot_nick(self, interaction: discord.Interaction, nick: str):
-        if not is_premium(interaction): return await interaction.response.send_message("Premium only.", ephemeral=True)
-        await interaction.guild.me.edit(nick=nick)
-        await interaction.response.send_message("Done.")
-
-    @app_commands.command(description="Spoiler Image")
-    async def spoiler_img(self, interaction: discord.Interaction, url: str):
-        if not is_premium(interaction): return await interaction.response.send_message("Premium only.", ephemeral=True)
-        
-        view = View()
-        btn = Button(label="Show Image", style=discord.ButtonStyle.secondary)
-        async def cb(i): await i.response.send_message(f"|| {url} ||", ephemeral=True)
-        btn.callback = cb
-        view.add_item(btn)
-        
-        await interaction.response.send_message(f"🔒 **{interaction.user.name}** shared a secret.", view=view)
-
-client.tree.add_command(Premium())
-
-# --- ERROR HANDLER ---
-@client.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.CommandOnCooldown):
-        await interaction.response.send_message(f"Cooldown: {error.retry_after:.2f}s", ephemeral=True)
-    elif isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("❌ Missing Permissions.", ephemeral=True)
-    elif isinstance(error, app_commands.CheckFailure):
-        await interaction.response.send_message("❌ Access Denied (Maintenance/Premium/Admin)", ephemeral=True)
+            await message.reply("🤔 File not found! Link galat ya expire ho gaya ho.")
     else:
-        print(f"Error: {error}")
+        txt = (
+            "🙏 **Namaste Bhai! System ON hai.**\n\n"
+            "**File Linker:** Mujhe private me koi file bhejo, main shareable link dunga.\n\n"
+            "**Group Commands:**\n"
+            "👮 `/warn` - Warning de bande ko\n"
+            "☢️ `/nuke` - Chat clear\n"
+            "📢 `/shout [msg]` - Zor se bol\n"
+            "🛑 `/shoutconfig [word]` - Word restrict kar\n"
+            "⬆️ `/promote` & ⬇️ `/demote` - Power control\n"
+            "🐢 `/setslowmode [sec]` - Chat speed\n"
+            "💤 `/afk [reason]` - Offline jao\n"
+            "📌 `/pin` & `/unpin` - Message chipkao\n"
+            "🎲 `/roll` & 🕺 `/bala` - Fun!\n"
+            "🤖 `/setautoreply [word] | [reply]` - Auto jawab\n"
+            "❌ `/deleteautoreply [word]`\n"
+            "🔑 `/login [pass]` - Secret access\n"
+            "⚙️ `/settings` - File bot mode (Admins)"
+        )
+        await message.reply(txt)
+
+@app.on_message(filters.private & (filters.document | filters.video | filters.photo | filters.audio))
+async def file_handler(client: Client, message: Message):
+    bot_mode = await get_bot_mode()
+    if bot_mode == "private" and message.from_user.id not in ADMINS:
+        return await message.reply("😔 **Sorry!** Abhi sirf Admins hi files upload kar sakte hain.")
+
+    status_msg = await message.reply("⏳ Please wait, file upload kar raha hu...", quote=True)
+    try:
+        forwarded_message = await message.forward(LOG_CHANNEL)
+        file_id_str = generate_random_string()
+        files_collection.insert_one({'_id': file_id_str, 'message_id': forwarded_message.id})
+        
+        bot_username = client.me.username if client.me else (await client.get_me()).username
+        share_link = f"https://t.me/{bot_username}?start={file_id_str}"
+        await status_msg.edit_text(f"✅ **Link Generated Successfully!**\n\n🔗 Your Link: `{share_link}`", disable_web_page_preview=True)
+    except Exception as e:
+        await status_msg.edit_text(f"❌ **Error!** Kuch galat ho gaya.\n`Details: {e}`")
+
+@app.on_message(filters.command("settings") & filters.private)
+async def settings_handler(client: Client, message: Message):
+    if message.from_user.id not in ADMINS:
+        return await message.reply("❌ Aapke paas permission nahi hai.")
+    
+    current_mode = await get_bot_mode()
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌍 Public (Anyone)", callback_data="set_mode_public")],
+        [InlineKeyboardButton("🔒 Private (Admins Only)", callback_data="set_mode_private")]
+    ])
+    await message.reply(f"⚙️ **Bot Settings**\nUpload mode: **{current_mode.upper()}**\nNaya mode select karein:", reply_markup=keyboard)
+
+# ==========================================
+# ============ 2. GROUP MODERATION =========
+# ==========================================
+
+@app.on_message(filters.command("login"))
+async def login(client: Client, message: Message):
+    if len(message.command) > 1 and message.command[1] == ADMIN_PASSWORD:
+        authorized_users.add(message.from_user.id)
+        await message.reply("😎 **System Set!** Ab tu Admin hai.")
+    else:
+        await message.reply("🤨 **Galat Password!** Nikal pehli fursat mein.")
+
+@app.on_message(filters.command("warn") & filters.group)
+async def warn_user(client: Client, message: Message):
+    if not await is_admin(message): return await message.reply("⛔ Power nahi hai tere paas!")
+    if not message.reply_to_message: return await message.reply("Kisko warn du? Message pe reply kar!")
+        
+    target = message.reply_to_message.from_user
+    chat_id = message.chat.id
+    bot_id = (await client.get_me()).id
+    
+    if target.id == bot_id:
+        return await message.reply("🤬 **Apne baap ko warning dega?**")
+        
+    current_warns = warns.get(target.id, 0) + 1
+    warns[target.id] = current_warns
+    msg = f"⚠️ **Warning!**\nUser: {target.first_name}\nCount: {current_warns}/3\nSudhar ja varna uda dunga!"
+    
+    if current_warns >= 3:
+        try:
+            await client.ban_chat_member(chat_id, target.id)
+            warns[target.id] = 0 
+            msg = f"🚫 **Khatam!** {target.first_name} ko 3 warning ke baad uda diya."
+        except Exception:
+            msg += "\n(Main isko ban nahi kar pa raha, shayad ye Admin hai)"
+    await message.reply(msg)
+
+@app.on_message(filters.command("shout"))
+async def shout(client: Client, message: Message):
+    msg = " ".join(message.command[1:]).upper()
+    if not msg: return await message.reply("Kya chilana hai? Likh to sahi!")
+    await message.reply(f"📢 **{msg}**")
+
+@app.on_message(filters.command("shoutconfig"))
+async def shoutconfig(client: Client, message: Message):
+    if not await is_admin(message): return
+    if len(message.command) < 2: return await message.reply("❌ Kisko block karu? Likh to sahi.")
+        
+    word = "".join(message.command[1:]).replace(".", "").lower()
+    restricted_words.add(word)
+    await fb_put(f"restricted/{word}", True)
+    await message.reply(f"🛑 **Restricted!** Word '{word}' ab block ho gaya hai.")
+
+@app.on_message(filters.command("nuke") & filters.group)
+async def nuke_request(client: Client, message: Message):
+    if not await is_admin(message): return
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Haan, Uda Do", callback_data='nuke_yes'),
+         InlineKeyboardButton("❌ Nahi Mazak Tha", callback_data='nuke_no')]
+    ])
+    await message.reply("💣 **Confirm Nuke?**\nKya sach mein chat clear karni hai?", reply_markup=keyboard)
+
+@app.on_message(filters.command("promote") & filters.group)
+async def promote(client: Client, message: Message):
+    if not await is_admin(message): return
+    if not message.reply_to_message: return await message.reply("Reply kar jisko promote karna hai.")
+    
+    user_id = message.reply_to_message.from_user.id
+    bot_id = (await client.get_me()).id
+    if user_id == bot_id: return await message.reply("🤖 Main already sabse powerful hoon bhai!")
+         
+    try:
+        await client.promote_chat_member(
+            message.chat.id, user_id,
+            privileges=ChatPrivileges(can_manage_chat=True, can_delete_messages=True, can_invite_users=True, can_pin_messages=True)
+        )
+        await message.reply("🌟 **Mubarak Ho!** Ab ye banda VIP (Admin) ban gaya hai.")
+    except Exception as e: await message.reply(f"❌ Error: {e}")
+
+@app.on_message(filters.command("demote") & filters.group)
+async def demote(client: Client, message: Message):
+    if not await is_admin(message): return
+    if not message.reply_to_message: return
+    
+    user_id = message.reply_to_message.from_user.id
+    bot_id = (await client.get_me()).id
+    if user_id == bot_id: return await message.reply("❌ **Main apne aap ko demote nahi karunga!**")
+         
+    try:
+        await client.promote_chat_member(
+            message.chat.id, user_id, privileges=ChatPrivileges(can_manage_chat=False, can_delete_messages=False)
+        )
+        await message.reply("🤡 **Power Khatam!** Ab ye aam aadmi hai.")
+    except Exception as e: await message.reply(f"❌ Error: {e}")
+
+@app.on_message(filters.command("setslowmode") & filters.group)
+async def set_slow_mode(client: Client, message: Message):
+    if not await is_admin(message): return
+    if len(message.command) < 2: return await message.reply("Time (seconds) likh bhai.")
+    try:
+        seconds = int(message.command[1])
+        await client.set_slow_mode(message.chat.id, seconds)
+        await message.reply(f"🐢 **Slow Mode On!** Ab har {seconds}s baad message aayega.")
+    except Exception:
+        await message.reply("❌ Error: Valid seconds daal (0, 10, 30, 60...).")
+
+@app.on_message(filters.command("pin"))
+async def pin_msg(client: Client, message: Message):
+    if not await is_admin(message): return
+    if not message.reply_to_message: return
+    try:
+        await message.reply_to_message.pin()
+        await message.reply("📌 **Chipka Diya!** (Pinned)")
+    except Exception: pass
+
+@app.on_message(filters.command("unpin"))
+async def unpin_msg(client: Client, message: Message):
+    if not await is_admin(message): return
+    if not message.reply_to_message: return
+    try:
+        await message.reply_to_message.unpin()
+        await message.reply("📌 **Ukhad Diya!** (Unpinned)")
+    except Exception: pass
+
+# ==========================================
+# ============ 3. FUN & AUTO SYSTEMS =======
+# ==========================================
+
+@app.on_message(filters.command("afk"))
+async def afk(client: Client, message: Message):
+    user = message.from_user
+    reason = " ".join(message.command[1:]) if len(message.command) > 1 else "Bas aise hi"
+    username = user.username.lower() if user.username else ""
+    afk_data = {"reason": reason, "username": username}
+    
+    afk_users[str(user.id)] = afk_data
+    await fb_put(f"afk/{user.id}", afk_data)
+    await message.reply(f"💤 **{user.first_name}** abhi neend mein hai (AFK).\nReason: {reason}")
+
+@app.on_message(filters.command("roll"))
+async def roll(client: Client, message: Message):
+    await client.send_dice(message.chat.id)
+
+@app.on_message(filters.command("bala"))
+async def bala(client: Client, message: Message):
+    gif = "https://media1.tenor.com/m/C3eR0iU1tBIAAAAd/akshay-kumar-dance.gif"
+    await client.send_animation(message.chat.id, gif, caption="🕺 **Shaitan ka Saala!**")
+
+@app.on_message(filters.command("setautoreply"))
+async def set_auto_reply(client: Client, message: Message):
+    if not await is_admin(message): return
+    text = " ".join(message.command[1:])
+    if "|" not in text: return await message.reply("❌ Format galat hai.\nAise likh: `/setautoreply Hello | Namaste`")
+    
+    trigger, response = text.split("|", 1)
+    clean_trigger = trigger.replace(" ", "").replace(".", "").lower()
+    auto_replies[clean_trigger] = response.strip()
+    await fb_put(f"autoreplies/{clean_trigger}", response.strip())
+    await message.reply(f"✅ **Saved!** Jab koi '{trigger.strip()}' bolega, main '{response.strip()}' bolunga.")
+
+@app.on_message(filters.command("deleteautoreply"))
+async def delete_auto_reply(client: Client, message: Message):
+    if not await is_admin(message): return
+    if len(message.command) < 2: return await message.reply("❌ Kisko delete karu? Word likho.")
+    
+    trigger = " ".join(message.command[1:]).replace(" ", "").replace(".", "").lower()
+    if trigger in auto_replies:
+        del auto_replies[trigger]
+        await fb_delete(f"autoreplies/{trigger}")
+        await message.reply("🗑️ **Deleted!** Ab reply nahi karunga us word pe.")
+    else:
+        await message.reply("❌ Ye word set hi nahi tha bhai.")
+
+# ==========================================
+# ============ 4. CALLBACKS & INTERCEPTS ===
+# ==========================================
+
+@app.on_callback_query()
+async def callbacks(client: Client, query: CallbackQuery):
+    data = query.data
+    user_id = query.from_user.id
+    
+    # 4a. Join Check
+    if data.startswith("check_join_"):
+        file_id_str = data.split("_", 2)[2]
+        if await is_user_member(client, user_id):
+            await query.answer("Thanks for joining! File bhej raha hu...", show_alert=True)
+            file_record = files_collection.find_one({"_id": file_id_str})
+            if file_record:
+                try:
+                    await client.copy_message(user_id, LOG_CHANNEL, file_record['message_id'])
+                    await query.message.delete()
+                except Exception as e: await query.message.edit_text(f"❌ Error: {e}")
+            else: await query.message.edit_text("🤔 File not found!")
+        else:
+            await query.answer("Aapne abhi tak channel join nahi kiya hai!", show_alert=True)
+            
+    # 4b. Settings Modes
+    elif data.startswith("set_mode_"):
+        if user_id not in ADMINS: return await query.answer("Permission Denied!", show_alert=True)
+        new_mode = data.split("_")[2]
+        settings_collection.update_one({"_id": "bot_mode"}, {"$set": {"mode": new_mode}}, upsert=True)
+        await query.answer(f"Mode {new_mode.upper()} par set ho gaya!", show_alert=True)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🌍 Public (Anyone)", callback_data="set_mode_public")],
+            [InlineKeyboardButton("🔒 Private (Admins Only)", callback_data="set_mode_private")]
+        ])
+        await query.message.edit_text(f"⚙️ **Bot Settings**\n✅ Upload mode ab **{new_mode.upper()}** hai.", reply_markup=keyboard)
+
+    # 4c. Nuke Feature
+    elif data == 'nuke_no':
+        await query.edit_message_text("👍 **Bach gaye!** Nuke cancel kar diya.")
+    elif data == 'nuke_yes':
+        await query.edit_message_text("☢️ **Nuke Incoming...** Messages ud rahe hain.")
+        msg_id = query.message.id
+        msg_ids_to_delete = list(range(max(1, msg_id - 60), msg_id)) # Pyrogram accepts list of IDs!
+        try:
+            await client.delete_messages(query.message.chat.id, msg_ids_to_delete)
+            await query.message.reply_text("💥 **Boom!** Messages ki chatni bana di.")
+        except Exception:
+            await query.message.reply_text("Error: Kuch messages delete nahi huye.")
+
+@app.on_message(filters.text & ~filters.command & filters.group)
+async def message_interceptor(client: Client, message: Message):
+    text = message.text
+    text_lower = text.lower()
+    clean_text = text_lower.replace(" ", "").replace(".", "")
+    user_id_str = str(message.from_user.id)
+
+    # 1. Restricted Words Check
+    for rword in restricted_words:
+        if rword in clean_text:
+            try: return await message.delete()
+            except Exception: return
+
+    # 2. Sender AFK Remove
+    if user_id_str in afk_users:
+        del afk_users[user_id_str]
+        await fb_delete(f"afk/{user_id_str}") 
+        await message.reply(f"👋 **Welcome Back {message.from_user.first_name}!**\nNeend khul gayi?")
+
+    # 3. Replied User AFK
+    if message.reply_to_message and message.reply_to_message.from_user:
+        replied_user_id = str(message.reply_to_message.from_user.id)
+        if replied_user_id in afk_users:
+            reason = afk_users[replied_user_id]["reason"]
+            await message.reply(f"Person Is busy: {reason}")
+
+    # 4. Mentioned User AFK
+    for uid, data in afk_users.items():
+        afk_username = data.get("username")
+        if afk_username and f"@{afk_username}" in text_lower:
+            await message.reply(f"Person Is busy: {data['reason']}")
+            break 
+
+    # 5. Auto Reply Check
+    for trigger, response in auto_replies.items():
+        if trigger in clean_text:
+            await message.reply(response)
+            break
+
+# --- Initialization Block ---
+async def start_services():
+    logger.info("🤖 Pyrogram Bot is connecting...")
+    await app.start()
+    logger.info("🔥 Loading Firebase In-Memory Data...")
+    await load_firebase_data()
+    logger.info("✅ Bot is fully running! Waiting for updates...")
+    await idle()
+    await app.stop()
 
 if __name__ == "__main__":
-    if TOKEN:
-        client.run(TOKEN)
-    else:
-        print("❌ Error: DISCORD_TOKEN not found in .env file.")
+    if not API_ID or not BOT_TOKEN:
+        logger.error("❌ Required Environment variables are missing!")
+        exit(1)
+        
+    keep_alive() # Start Web Server 24/7 Check
+    
+    # Run async setup tasks
+    app.run(start_services())
