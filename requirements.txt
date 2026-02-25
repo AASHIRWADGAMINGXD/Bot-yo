@@ -1,5 +1,6 @@
-discord.py 
+pyrogram>=2.0.0
+tgcrypto
+pymongo[srv]
 python-dotenv
-pytesseract 
-pillow 
 flask
+httpx>=0.23.0
