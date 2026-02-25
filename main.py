@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 import asyncio
 import random
@@ -7,8 +8,19 @@ import httpx
 from threading import Thread
 from dotenv import load_dotenv
 
+# =========================================================
+# 🔴 URGENT FIX FOR RENDER / PYTHON 3.10+ EVENT LOOP CRASH
+# This MUST come before the Pyrogram import
+# =========================================================
+try:
+    loop = asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+# =========================================================
+
 from pyrogram import Client, filters, enums, idle
-from pyrogram.errors import UserNotParticipant, FloodWait
+from pyrogram.errors import UserNotParticipant
 from pyrogram.types import (
     InlineKeyboardButton, 
     InlineKeyboardMarkup, 
@@ -438,15 +450,18 @@ async def callbacks(client: Client, query: CallbackQuery):
     elif data == 'nuke_yes':
         await query.edit_message_text("☢️ **Nuke Incoming...** Messages ud rahe hain.")
         msg_id = query.message.id
-        msg_ids_to_delete = list(range(max(1, msg_id - 60), msg_id)) # Pyrogram accepts list of IDs!
+        msg_ids_to_delete = list(range(max(1, msg_id - 60), msg_id + 1))
         try:
             await client.delete_messages(query.message.chat.id, msg_ids_to_delete)
             await query.message.reply_text("💥 **Boom!** Messages ki chatni bana di.")
         except Exception:
             await query.message.reply_text("Error: Kuch messages delete nahi huye.")
 
-@app.on_message(filters.text & ~filters.command & filters.group)
+@app.on_message(filters.text & filters.group)
 async def message_interceptor(client: Client, message: Message):
+    if message.text.startswith("/"):
+        return # Ignore commands, let command handlers process them
+        
     text = message.text
     text_lower = text.lower()
     clean_text = text_lower.replace(" ", "").replace(".", "")
@@ -501,5 +516,8 @@ if __name__ == "__main__":
         
     keep_alive() # Start Web Server 24/7 Check
     
-    # Run async setup tasks
-    app.run(start_services())
+    # Using the exact loop we defined at the very top
+    try:
+        loop.run_until_complete(start_services())
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot Stopped Manually.")
