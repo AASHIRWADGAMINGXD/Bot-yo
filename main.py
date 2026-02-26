@@ -1,3 +1,14 @@
+import asyncio
+import sys
+
+# --- FIX FOR PYTHON 3.12+ / 3.14 EVENT LOOP ISSUE ---
+# This must run before pyrogram is imported
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
 import os
 import logging
 import random
@@ -7,10 +18,10 @@ from pyrogram import Client, filters, enums
 from pyrogram.errors import UserNotParticipant
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 from pymongo import MongoClient
-from flask import Flask # <-- Yahan add kiya hai
-from threading import Thread # <-- Yahan add kiya hai
+from flask import Flask 
+from threading import Thread 
 
-# --- Flask Web Server (Render ko busy rakhne ke liye) ---
+# --- Flask Web Server (To keep Render alive) ---
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -21,22 +32,21 @@ def run_flask():
     # Render port ko environment variable se leta hai
     port = int(os.environ.get('PORT', 8080))
     flask_app.run(host='0.0.0.0', port=port)
-# --- Web Server ka code yahan khatam ---
-
 
 # --- Basic Logging ---
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # --- Load Environment Variables ---
 load_dotenv()
 
 # --- Configuration ---
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MONGO_URI = os.environ.get("MONGO_URI")
-LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL")) 
-UPDATE_CHANNEL = os.environ.get("UPDATE_CHANNEL") 
+API_ID = int(os.environ.get("API_ID", 0))
+API_HASH = os.environ.get("API_HASH", "")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+MONGO_URI = os.environ.get("MONGO_URI", "")
+LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL", 0)) 
+UPDATE_CHANNEL = os.environ.get("UPDATE_CHANNEL", "") 
 
 # Admin configuration
 ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "")
@@ -51,7 +61,7 @@ try:
     logging.info("MongoDB Connected Successfully!")
 except Exception as e:
     logging.error(f"Error connecting to MongoDB: {e}")
-    exit()
+    sys.exit(1)
 
 # --- Pyrogram Client ---
 app = Client("FileLinkBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -85,12 +95,12 @@ async def start_handler(client: Client, message: Message):
         file_id_str = message.command[1]
         
         if not await is_user_member(client, message.from_user.id):
-            join_button = InlineKeyboardButton("ð Join Channel", url=f"https://t.me/{UPDATE_CHANNEL}")
-            joined_button = InlineKeyboardButton("â I Have Joined", callback_data=f"check_join_{file_id_str}")
+            join_button = InlineKeyboardButton("🔗 Join Channel", url=f"https://t.me/{UPDATE_CHANNEL}")
+            joined_button = InlineKeyboardButton("✅ I Have Joined", callback_data=f"check_join_{file_id_str}")
             keyboard = InlineKeyboardMarkup([[join_button], [joined_button]])
             
             await message.reply(
-                f"ð **Hello, {message.from_user.first_name}!**\n\nYe file access karne ke liye, aapko hamara update channel join karna hoga.",
+                f"👋 **Hello, {message.from_user.first_name}!**\n\nYe file access karne ke liye, aapko hamara update channel join karna hoga.",
                 reply_markup=keyboard
             )
             return
@@ -100,9 +110,9 @@ async def start_handler(client: Client, message: Message):
             try:
                 await client.copy_message(chat_id=message.from_user.id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
             except Exception as e:
-                await message.reply(f"â Sorry, file bhejte waqt ek error aa gaya.\n`Error: {e}`")
+                await message.reply(f"❌ Sorry, file bhejte waqt ek error aa gaya.\n`Error: {e}`")
         else:
-            await message.reply("ð¤ File not found! Ho sakta hai link galat ya expire ho gaya ho.")
+            await message.reply("🤔 File not found! Ho sakta hai link galat ya expire ho gaya ho.")
     else:
         await message.reply("**Hello! Mai ek File-to-Link bot hu.**\n\nMujhe koi bhi file bhejo, aur mai aapko uska ek shareable link dunga.")
 
@@ -110,10 +120,10 @@ async def start_handler(client: Client, message: Message):
 async def file_handler(client: Client, message: Message):
     bot_mode = await get_bot_mode()
     if bot_mode == "private" and message.from_user.id not in ADMINS:
-        await message.reply("ð **Sorry!** Abhi sirf Admins hi files upload kar sakte hain.")
+        await message.reply("😔 **Sorry!** Abhi sirf Admins hi files upload kar sakte hain.")
         return
 
-    status_msg = await message.reply("â³ Please wait, file upload kar raha hu...", quote=True)
+    status_msg = await message.reply("⏳ Please wait, file upload kar raha hu...", quote=True)
     
     try:
         forwarded_message = await message.forward(LOG_CHANNEL)
@@ -122,27 +132,27 @@ async def file_handler(client: Client, message: Message):
         bot_username = (await client.get_me()).username
         share_link = f"https://t.me/{bot_username}?start={file_id_str}"
         await status_msg.edit_text(
-            f"â **Link Generated Successfully!**\n\nð Your Link: `{share_link}`",
+            f"✅ **Link Generated Successfully!**\n\n🔗 Your Link: `{share_link}`",
             disable_web_page_preview=True
         )
     except Exception as e:
         logging.error(f"File handling error: {e}")
-        await status_msg.edit_text(f"â **Error!**\n\nKuch galat ho gaya. Please try again.\n`Details: {e}`")
+        await status_msg.edit_text(f"❌ **Error!**\n\nKuch galat ho gaya. Please try again.\n`Details: {e}`")
 
 @app.on_message(filters.command("settings") & filters.private)
 async def settings_handler(client: Client, message: Message):
     if message.from_user.id not in ADMINS:
-        await message.reply("â Aapke paas is command ko use karne ki permission nahi hai.")
+        await message.reply("❌ Aapke paas is command ko use karne ki permission nahi hai.")
         return
     
     current_mode = await get_bot_mode()
     
-    public_button = InlineKeyboardButton("ð Public (Anyone)", callback_data="set_mode_public")
-    private_button = InlineKeyboardButton("ð Private (Admins Only)", callback_data="set_mode_private")
+    public_button = InlineKeyboardButton("🌍 Public (Anyone)", callback_data="set_mode_public")
+    private_button = InlineKeyboardButton("🔒 Private (Admins Only)", callback_data="set_mode_private")
     keyboard = InlineKeyboardMarkup([[public_button], [private_button]])
     
     await message.reply(
-        f"âï¸ **Bot Settings**\n\n"
+        f"⚙️ **Bot Settings**\n\n"
         f"Abhi bot ka file upload mode **{current_mode.upper()}** hai.\n\n"
         f"**Public:** Koi bhi file bhej kar link bana sakta hai.\n"
         f"**Private:** Sirf admins hi file bhej sakte hain.\n\n"
@@ -166,13 +176,13 @@ async def set_mode_callback(client: Client, callback_query: CallbackQuery):
     
     await callback_query.answer(f"Mode successfully {new_mode.upper()} par set ho gaya hai!", show_alert=True)
     
-    public_button = InlineKeyboardButton("ð Public (Anyone)", callback_data="set_mode_public")
-    private_button = InlineKeyboardButton("ð Private (Admins Only)", callback_data="set_mode_private")
+    public_button = InlineKeyboardButton("🌍 Public (Anyone)", callback_data="set_mode_public")
+    private_button = InlineKeyboardButton("🔒 Private (Admins Only)", callback_data="set_mode_private")
     keyboard = InlineKeyboardMarkup([[public_button], [private_button]])
     
     await callback_query.message.edit_text(
-        f"âï¸ **Bot Settings**\n\n"
-        f"â Bot ka file upload mode ab **{new_mode.upper()}** hai.\n\n"
+        f"⚙️ **Bot Settings**\n\n"
+        f"✅ Bot ka file upload mode ab **{new_mode.upper()}** hai.\n\n"
         f"Naya mode select karein:",
         reply_markup=keyboard
     )
@@ -190,22 +200,22 @@ async def check_join_callback(client: Client, callback_query: CallbackQuery):
                 await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
                 await callback_query.message.delete()
             except Exception as e:
-                await callback_query.message.edit_text(f"â File bhejte waqt error aa gaya.\n`Error: {e}`")
+                await callback_query.message.edit_text(f"❌ File bhejte waqt error aa gaya.\n`Error: {e}`")
         else:
-            await callback_query.message.edit_text("ð¤ File not found!")
+            await callback_query.message.edit_text("🤔 File not found!")
     else:
         await callback_query.answer("Aapne abhi tak channel join nahi kiya hai. Please join karke dobara try karein.", show_alert=True)
 
-# --- Bot ko Start Karo ---
+# --- Bot Execution ---
 if __name__ == "__main__":
     if not ADMINS:
         logging.warning("WARNING: ADMIN_IDS is not set. Settings command kaam nahi karega.")
     
-    # Flask server ko ek alag thread me start karo
+    # 1. Start Flask server in separate thread
     logging.info("Starting Flask web server...")
-    flask_thread = Thread(target=run_flask)
+    flask_thread = Thread(target=run_flask, daemon=True)
     flask_thread.start()
     
+    # 2. Run Pyrogram
     logging.info("Bot is starting...")
     app.run()
-    logging.info("Bot has stopped.")
