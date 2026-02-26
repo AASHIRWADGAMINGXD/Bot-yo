@@ -1,6 +1,6 @@
-pyrogram>=2.0.106
+pyrogram
 tgcrypto
-pymongo[srv]
-python-dotenv
+pymongo
+dnspython
 flask
-httpx>=0.23.0
+python-dotenv
