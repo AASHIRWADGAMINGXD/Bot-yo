@@ -1,211 +1,221 @@
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+import json
 import os
-import logging
+import sqlite3
+import datetime
+import asyncio
 import random
-import string
-from dotenv import load_dotenv
-from pyrogram import Client, filters, enums
-from pyrogram.errors import UserNotParticipant
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
-from pymongo import MongoClient
-from flask import Flask # <-- Yahan add kiya hai
-from threading import Thread # <-- Yahan add kiya hai
+from flask import Flask
+from threading import Thread
 
-# --- Flask Web Server (Render ko busy rakhne ke liye) ---
-flask_app = Flask(__name__)
+# --- FLASK SERVER FOR 24/7 ---
+app = Flask('')
 
-@flask_app.route('/')
-def index():
-    return "Bot is alive!", 200
+@app.route('/')
+def home():
+    return "Vantix Management is Online!"
 
-def run_flask():
-    # Render port ko environment variable se leta hai
-    port = int(os.environ.get('PORT', 8080))
-    flask_app.run(host='0.0.0.0', port=port)
-# --- Web Server ka code yahan khatam ---
+def run():
+    app.run(host='0.0.0.0', port=8080)
 
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
 
-# --- Basic Logging ---
-logging.basicConfig(level=logging.INFO)
+# --- DATABASE SETUP ---
+conn = sqlite3.connect('vantix_data.db')
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS settings 
+             (guild_id TEXT PRIMARY KEY, prefix TEXT, welcome_enabled INTEGER, bad_words TEXT)''')
+c.execute('''CREATE TABLE IF NOT EXISTS auto_replies 
+             (guild_id TEXT, trigger TEXT, response TEXT)''')
+conn.commit()
 
-# --- Load Environment Variables ---
-load_dotenv()
+# --- BOT SETUP ---
+def get_prefix(bot, message):
+    c.execute("SELECT prefix FROM settings WHERE guild_id = ?", (str(message.guild.id),))
+    res = c.fetchone()
+    return res[0] if res else "!"
 
-# --- Configuration ---
-API_ID = int(os.environ.get("API_ID"))
-API_HASH = os.environ.get("API_HASH")
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-MONGO_URI = os.environ.get("MONGO_URI")
-LOG_CHANNEL = int(os.environ.get("LOG_CHANNEL")) 
-UPDATE_CHANNEL = os.environ.get("UPDATE_CHANNEL") 
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix=get_prefix, intents=intents, help_command=None)
 
-# Admin configuration
-ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "")
-ADMINS = [int(admin_id.strip()) for admin_id in ADMIN_IDS_STR.split(',') if admin_id]
+# --- HELPER FUNCTIONS ---
+def is_owner(ctx):
+    return ctx.author.id == ctx.guild.owner_id
 
-# --- Database Setup ---
-try:
-    client = MongoClient(MONGO_URI)
-    db = client['file_link_bot']
-    files_collection = db['files']
-    settings_collection = db['settings']
-    logging.info("MongoDB Connected Successfully!")
-except Exception as e:
-    logging.error(f"Error connecting to MongoDB: {e}")
-    exit()
+# --- EVENTS ---
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user.name}')
+    await bot.change_presence(status=discord.Status.online, activity=discord.Game(name="Managing Vantix Nodes"))
 
-# --- Pyrogram Client ---
-app = Client("FileLinkBot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+@bot.event
+async def on_member_join(member):
+    c.execute("SELECT welcome_enabled FROM settings WHERE guild_id = ?", (str(member.guild.id),))
+    res = c.fetchone()
+    if res and res[0] == 1:
+        channel = discord.utils.get(member.guild.text_channels, name="welcome")
+        if channel:
+            embed = discord.Embed(title="Welcome to Vantix Nodes!", color=0xFF0000, timestamp=datetime.datetime.utcnow())
+            embed.description = f"Welcome {member.mention} to the server!\n\n📜 **Read Rules:** <#rules-channel-id>\n⚖️ **Terms:** <#tos-channel-id>\n🚀 **Enjoy your stay!**"
+            embed.set_thumbnail(url=member.avatar.url if member.avatar else None)
+            embed.set_footer(text="Vantix Management System")
+            await channel.send(embed=embed)
 
-# --- Helper Functions ---
-def generate_random_string(length=6):
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+@bot.event
+async def on_message(message):
+    if message.author.bot: return
 
-async def is_user_member(client: Client, user_id: int) -> bool:
-    try:
-        await client.get_chat_member(chat_id=f"@{UPDATE_CHANNEL}", user_id=user_id)
-        return True
-    except UserNotParticipant:
-        return False
-    except Exception as e:
-        logging.error(f"Error checking membership for {user_id}: {e}")
-        return False
-
-async def get_bot_mode() -> str:
-    setting = settings_collection.find_one({"_id": "bot_mode"})
-    if setting:
-        return setting.get("mode", "public")
-    settings_collection.update_one({"_id": "bot_mode"}, {"$set": {"mode": "public"}}, upsert=True)
-    return "public"
-
-# --- Bot Command Handlers ---
-
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(client: Client, message: Message):
-    if len(message.command) > 1:
-        file_id_str = message.command[1]
-        
-        if not await is_user_member(client, message.from_user.id):
-            join_button = InlineKeyboardButton("ð Join Channel", url=f"https://t.me/{UPDATE_CHANNEL}")
-            joined_button = InlineKeyboardButton("â I Have Joined", callback_data=f"check_join_{file_id_str}")
-            keyboard = InlineKeyboardMarkup([[join_button], [joined_button]])
-            
-            await message.reply(
-                f"ð **Hello, {message.from_user.first_name}!**\n\nYe file access karne ke liye, aapko hamara update channel join karna hoga.",
-                reply_markup=keyboard
-            )
+    # Bad Words Filter
+    c.execute("SELECT bad_words FROM settings WHERE guild_id = ?", (str(message.guild.id),))
+    res = c.fetchone()
+    if res and res[0]:
+        words = res[0].split(',')
+        if any(word in message.content.lower() for word in words):
+            await message.delete()
+            await message.channel.send(f"{message.author.mention}, that word is not allowed here!", delete_after=5)
             return
 
-        file_record = files_collection.find_one({"_id": file_id_str})
-        if file_record:
-            try:
-                await client.copy_message(chat_id=message.from_user.id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
-            except Exception as e:
-                await message.reply(f"â Sorry, file bhejte waqt ek error aa gaya.\n`Error: {e}`")
-        else:
-            await message.reply("ð¤ File not found! Ho sakta hai link galat ya expire ho gaya ho.")
-    else:
-        await message.reply("**Hello! Mai ek File-to-Link bot hu.**\n\nMujhe koi bhi file bhejo, aur mai aapko uska ek shareable link dunga.")
+    # Auto Reply
+    c.execute("SELECT response FROM auto_replies WHERE guild_id = ? AND trigger = ?", (str(message.guild.id), message.content.lower()))
+    rep = c.fetchone()
+    if rep:
+        await message.reply(rep[0])
 
-@app.on_message(filters.private & (filters.document | filters.video | filters.photo | filters.audio))
-async def file_handler(client: Client, message: Message):
-    bot_mode = await get_bot_mode()
-    if bot_mode == "private" and message.from_user.id not in ADMINS:
-        await message.reply("ð **Sorry!** Abhi sirf Admins hi files upload kar sakte hain.")
-        return
+    await bot.process_commands(message)
 
-    status_msg = await message.reply("â³ Please wait, file upload kar raha hu...", quote=True)
-    
+# --- MODERATION COMMANDS ---
+@bot.command()
+@commands.has_permissions(kick_members=True)
+async def kick(ctx, member: discord.Member, *, reason="No reason provided"):
+    await member.kick(reason=reason)
+    await ctx.send(f"🔴 **{member.name}** has been kicked. Reason: {reason}")
+
+@bot.command()
+@commands.has_permissions(ban_members=True)
+async def ban(ctx, member: discord.Member, *, reason="No reason provided"):
+    await member.ban(reason=reason)
+    await ctx.send(f"🚫 **{member.name}** has been banned. Reason: {reason}")
+
+@bot.command()
+@commands.has_permissions(moderate_members=True)
+async def timeout(ctx, member: discord.Member, minutes: int, *, reason="No reason"):
+    duration = datetime.timedelta(minutes=minutes)
+    await member.timeout(duration, reason=reason)
+    await ctx.send(f"⏳ **{member.name}** timed out for {minutes}m. Reason: {reason}")
+
+# --- CHANNEL MANAGEMENT ---
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+async def lock(ctx):
+    await ctx.channel.set_permissions(ctx.guild.default_role, send_messages=False)
+    await ctx.send("🔒 Channel locked.")
+
+@bot.command()
+@commands.has_permissions(manage_channels=True)
+async def unlock(ctx):
+    await ctx.channel.set_permissions(ctx.guild.default_role, send_messages=True)
+    await ctx.send("🔓 Channel unlocked.")
+
+# --- UTILITY & CUSTOMIZATION ---
+@bot.command()
+async def prefix(ctx, new_prefix: str):
+    if not ctx.author.guild_permissions.administrator: return
+    c.execute("INSERT OR REPLACE INTO settings (guild_id, prefix) VALUES (?, ?)", (str(ctx.guild.id), new_prefix))
+    conn.commit()
+    await ctx.send(f"✅ Prefix changed to: `{new_prefix}`")
+
+@bot.command()
+async def status(ctx, type: str):
+    if not is_owner(ctx): return
+    states = {"online": discord.Status.online, "idle": discord.Status.idle, "dnd": discord.Status.dnd}
+    if type.lower() in states:
+        await bot.change_presence(status=states[type.lower()])
+        await ctx.send(f"Status changed to `{type}`")
+
+@bot.command()
+async def dm(ctx, member: discord.Member, *, message: str):
+    if not is_owner(ctx): return
     try:
-        forwarded_message = await message.forward(LOG_CHANNEL)
-        file_id_str = generate_random_string()
-        files_collection.insert_one({'_id': file_id_str, 'message_id': forwarded_message.id})
-        bot_username = (await client.get_me()).username
-        share_link = f"https://t.me/{bot_username}?start={file_id_str}"
-        await status_msg.edit_text(
-            f"â **Link Generated Successfully!**\n\nð Your Link: `{share_link}`",
-            disable_web_page_preview=True
-        )
-    except Exception as e:
-        logging.error(f"File handling error: {e}")
-        await status_msg.edit_text(f"â **Error!**\n\nKuch galat ho gaya. Please try again.\n`Details: {e}`")
+        await member.send(f"**Message from Vantix Admin:**\n{message}")
+        await ctx.send(f"✅ Sent to {member.name}")
+    except:
+        await ctx.send("❌ Could not DM user.")
 
-@app.on_message(filters.command("settings") & filters.private)
-async def settings_handler(client: Client, message: Message):
-    if message.from_user.id not in ADMINS:
-        await message.reply("â Aapke paas is command ko use karne ki permission nahi hai.")
-        return
+# --- TICKET SYSTEM (EMBED CUSTOMIZER) ---
+@bot.command()
+async def setup_ticket(ctx, title, color_hex, *, description):
+    if not ctx.author.guild_permissions.administrator: return
+    color = int(color_hex.replace("#", ""), 16)
+    embed = discord.Embed(title=title, description=description, color=color)
+    embed.set_footer(text="Click the button below to open a ticket.")
     
-    current_mode = await get_bot_mode()
+    view = discord.ui.View()
+    button = discord.ui.Button(label="Open Ticket", style=discord.ButtonStyle.danger, custom_id="open_ticket_btn")
+    view.add_item(button)
     
-    public_button = InlineKeyboardButton("ð Public (Anyone)", callback_data="set_mode_public")
-    private_button = InlineKeyboardButton("ð Private (Admins Only)", callback_data="set_mode_private")
-    keyboard = InlineKeyboardMarkup([[public_button], [private_button]])
-    
-    await message.reply(
-        f"âï¸ **Bot Settings**\n\n"
-        f"Abhi bot ka file upload mode **{current_mode.upper()}** hai.\n\n"
-        f"**Public:** Koi bhi file bhej kar link bana sakta hai.\n"
-        f"**Private:** Sirf admins hi file bhej sakte hain.\n\n"
-        f"Naya mode select karein:",
-        reply_markup=keyboard
-    )
+    await ctx.send(embed=embed, view=view)
 
-@app.on_callback_query(filters.regex(r"^set_mode_"))
-async def set_mode_callback(client: Client, callback_query: CallbackQuery):
-    if callback_query.from_user.id not in ADMINS:
-        await callback_query.answer("Permission Denied!", show_alert=True)
-        return
-        
-    new_mode = callback_query.data.split("_")[2]
+# --- GIVEAWAY ---
+@bot.command()
+async def giveaway(ctx, duration_sec: int, *, prize: str):
+    if not ctx.author.guild_permissions.administrator: return
+    embed = discord.Embed(title="🎉 GIVEAWAY 🎉", description=f"Prize: **{prize}**\nReact with 🎉 to enter!", color=0xFF0000)
+    msg = await ctx.send(embed=embed)
+    await msg.add_reaction("🎉")
+    await asyncio.sleep(duration_sec)
     
-    settings_collection.update_one(
-        {"_id": "bot_mode"},
-        {"$set": {"mode": new_mode}},
-        upsert=True
-    )
-    
-    await callback_query.answer(f"Mode successfully {new_mode.upper()} par set ho gaya hai!", show_alert=True)
-    
-    public_button = InlineKeyboardButton("ð Public (Anyone)", callback_data="set_mode_public")
-    private_button = InlineKeyboardButton("ð Private (Admins Only)", callback_data="set_mode_private")
-    keyboard = InlineKeyboardMarkup([[public_button], [private_button]])
-    
-    await callback_query.message.edit_text(
-        f"âï¸ **Bot Settings**\n\n"
-        f"â Bot ka file upload mode ab **{new_mode.upper()}** hai.\n\n"
-        f"Naya mode select karein:",
-        reply_markup=keyboard
-    )
-
-@app.on_callback_query(filters.regex(r"^check_join_"))
-async def check_join_callback(client: Client, callback_query: CallbackQuery):
-    user_id = callback_query.from_user.id
-    file_id_str = callback_query.data.split("_", 2)[2]
-
-    if await is_user_member(client, user_id):
-        await callback_query.answer("Thanks for joining! File bhej raha hu...", show_alert=True)
-        file_record = files_collection.find_one({"_id": file_id_str})
-        if file_record:
-            try:
-                await client.copy_message(chat_id=user_id, from_chat_id=LOG_CHANNEL, message_id=file_record['message_id'])
-                await callback_query.message.delete()
-            except Exception as e:
-                await callback_query.message.edit_text(f"â File bhejte waqt error aa gaya.\n`Error: {e}`")
-        else:
-            await callback_query.message.edit_text("ð¤ File not found!")
+    new_msg = await ctx.channel.fetch_message(msg.id)
+    users = [user async for user in new_msg.reactions[0].users() if not user.bot]
+    if users:
+        winner = random.choice(users)
+        await ctx.send(f"Congratulations {winner.mention}! You won **{prize}**!")
     else:
-        await callback_query.answer("Aapne abhi tak channel join nahi kiya hai. Please join karke dobara try karein.", show_alert=True)
+        await ctx.send("No one entered the giveaway.")
 
-# --- Bot ko Start Karo ---
-if __name__ == "__main__":
-    if not ADMINS:
-        logging.warning("WARNING: ADMIN_IDS is not set. Settings command kaam nahi karega.")
-    
-    # Flask server ko ek alag thread me start karo
-    logging.info("Starting Flask web server...")
-    flask_thread = Thread(target=run_flask)
-    flask_thread.start()
-    
-    logging.info("Bot is starting...")
-    app.run()
-    logging.info("Bot has stopped.")
+# --- WEBHOOK COMMAND ---
+@bot.command()
+async def webhook_send(ctx, webhook_url: str, title: str, *, content: str):
+    if not ctx.author.guild_permissions.administrator: return
+    from discord import SyncWebhook
+    webhook = SyncWebhook.from_url(webhook_url)
+    embed = discord.Embed(title=title, description=content, color=0xFF0000)
+    webhook.send(embed=embed, username="Vantix Management")
+    await ctx.send("✅ Webhook message sent.")
+
+# --- AUTO REPLY MGMT ---
+@bot.command()
+async def add_reply(ctx, trigger: str, *, response: str):
+    if not ctx.author.guild_permissions.administrator: return
+    c.execute("INSERT INTO auto_replies VALUES (?, ?, ?)", (str(ctx.guild.id), trigger.lower(), response))
+    conn.commit()
+    await ctx.send(f"✅ Auto-reply added for `{trigger}`")
+
+@bot.command()
+async def remove_reply(ctx, trigger: str):
+    if not ctx.author.guild_permissions.administrator: return
+    c.execute("DELETE FROM auto_replies WHERE guild_id = ? AND trigger = ?", (str(ctx.guild.id), trigger.lower()))
+    conn.commit()
+    await ctx.send(f"🗑️ Removed auto-reply for `{trigger}`")
+
+# --- BAD WORDS MGMT ---
+@bot.command()
+async def add_badword(ctx, word: str):
+    if not ctx.author.guild_permissions.administrator: return
+    c.execute("SELECT bad_words FROM settings WHERE guild_id = ?", (str(ctx.guild.id),))
+    res = c.fetchone()
+    current = res[0] if res and res[0] else ""
+    new_list = f"{current},{word.lower()}" if current else word.lower()
+    c.execute("INSERT OR REPLACE INTO settings (guild_id, bad_words) VALUES (?, ?)", (str(ctx.guild.id), new_list))
+    conn.commit()
+    await ctx.send(f"🚫 Added `{word}` to blacklist.")
+
+# --- STARTUP ---
+keep_alive()
+# token = os.environ.get("TOKEN")
+# bot.run(token)
+print("Run the bot by providing your token at the end of the file.")
+
