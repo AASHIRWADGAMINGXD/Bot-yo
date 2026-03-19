@@ -215,7 +215,7 @@ async def add_badword(ctx, word: str):
 
 # --- STARTUP ---
 keep_alive()
-# token = os.environ.get("TOKEN")
-# bot.run(token)
+ token = os.environ.get("TOKEN")
+ bot.run(token)
 print("Run the bot by providing your token at the end of the file.")
 
