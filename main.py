@@ -807,28 +807,33 @@ bot.tree.add_command(ServerStatsGroup(name="serverstats", description="Server st
 # ==========================================
 class WebhookGroup(app_commands.Group):
     @app_commands.command(name="api", description="Send webhook message")
-    async def webhook_api(self, interaction: discord.Interaction, title: str, message: str, channel: discord.TextChannel, embed_format: bool, color: str):
+    async def webhook_api(self, interaction: discord.Interaction, webhook_name: str, title: str, message: str, channel: discord.TextChannel, embed_format: bool, color: str):
+        # Fetch existing webhooks in the channel
         webhooks = await channel.webhooks()
+        
+        # Look for our existing webhook to NOT make a new one every time
         webhook = discord.utils.get(webhooks, name="Vantix Webhook")
         if not webhook:
             webhook = await channel.create_webhook(name="Vantix Webhook")
         
+        # Parse the color (Default if invalid)
         parsed_color = discord.Color.default()
         try:
             if color.startswith("#"):
                 parsed_color = discord.Color(int(color[1:], 16))
-        except: pass
+        except: 
+            pass
 
+        # Send the webhook using the inputted name (webhook_name) instead of interaction.user
         if embed_format:
             embed = discord.Embed(title=title, description=message, color=parsed_color)
-            await webhook.send(embed=embed, username=interaction.user.name, avatar_url=interaction.user.avatar.url if interaction.user.avatar else None)
+            await webhook.send(embed=embed, username=webhook_name)
         else:
-            await webhook.send(f"**{title}**\n{message}", username=interaction.user.name, avatar_url=interaction.user.avatar.url if interaction.user.avatar else None)
+            await webhook.send(f"**{title}**\n{message}", username=webhook_name)
         
-        await interaction.response.send_message(f"Sent webhook to {channel.mention}.", ephemeral=True)
+        await interaction.response.send_message(f"Sent webhook to {channel.mention} with the name '{webhook_name}'.", ephemeral=True)
 
 bot.tree.add_command(WebhookGroup(name="webhook", description="Webhook commands"))
-
 # ==========================================
 # LIVE STATUS MONITOR (TCP/HTTP)
 # ==========================================
