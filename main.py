@@ -5,7 +5,6 @@ import os
 import asyncio
 import requests
 import datetime
-import json
 import socket
 from flask import Flask
 from threading import Thread
@@ -387,7 +386,19 @@ class TicketGroup(app_commands.Group):
 
     @app_commands.command(name="claim", description="Claim a ticket")
     async def claim_cmd(self, interaction: discord.Interaction):
-        await interaction.response.send_message(f"Ticket claimed by {interaction.user.mention}.")
+        if "ticket" in interaction.channel.name:
+            await interaction.channel.send(f"Ticket claimed by {interaction.user.mention}.")
+            await interaction.response.send_message("Successfully claimed.", ephemeral=True)
+        else:
+            await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
+
+    @app_commands.command(name="rename", description="Rename the current ticket")
+    async def rename_cmd(self, interaction: discord.Interaction, new_name: str):
+        if "ticket" in interaction.channel.name:
+            await interaction.channel.edit(name=f"ticket-{new_name}")
+            await interaction.response.send_message(f"Ticket successfully renamed to `ticket-{new_name}`.")
+        else:
+            await interaction.response.send_message("This is not a ticket channel.", ephemeral=True)
 
     @app_commands.command(name="transcript", description="Generate ticket transcript")
     async def transcript(self, interaction: discord.Interaction):
@@ -442,7 +453,10 @@ class WelcomeGroup(app_commands.Group):
         if data:
             channel = interaction.guild.get_channel(data["channel"])
             msg = data["message"].replace("{user}", interaction.user.mention).replace("{server}", interaction.guild.name)
-            await channel.send(msg)
+            embed = discord.Embed(title="Welcome to Vantix Node", description=msg, color=discord.Color.blue())
+            if interaction.user.avatar:
+                embed.set_thumbnail(url=interaction.user.avatar.url)
+            await channel.send(embed=embed)
             await interaction.response.send_message("Test sent.", ephemeral=True)
         else:
             await interaction.response.send_message("Welcome not set up.", ephemeral=True)
@@ -591,6 +605,20 @@ class GiveawayGroup(app_commands.Group):
 
 bot.tree.add_command(GiveawayGroup(name="giveaway", description="Giveaway system"))
 
+@bot.tree.command(name="embed", description="Send a custom embed")
+@app_commands.default_permissions(manage_messages=True)
+async def create_embed(interaction: discord.Interaction, name: str, message: str, color: str):
+    parsed_color = discord.Color.default()
+    try:
+        if color.startswith("#"):
+            parsed_color = discord.Color(int(color[1:], 16))
+    except:
+        pass
+    
+    embed = discord.Embed(title=name, description=message, color=parsed_color)
+    await interaction.channel.send(embed=embed)
+    await interaction.response.send_message("Embed successfully sent!", ephemeral=True)
+
 @tasks.loop(seconds=30)
 async def giveaway_monitor():
     all_gws = Database.get("guilds") or {}
@@ -717,11 +745,11 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(name="👑 Owner", value="/superadmin, /extraowner, /botconfig")
     embed.add_field(name="🛡️ Security", value="/antinuke, /antispam, /badwords")
     embed.add_field(name="🔨 Moderation", value="/ban, /kick, /timeout, /warn, /purge, /lock...")
-    embed.add_field(name="🎫 Tickets", value="/ticket setup, /ticket panel...")
+    embed.add_field(name="🎫 Tickets", value="/ticket setup, /ticket rename, /ticket panel...")
     embed.add_field(name="👋 Welcome/Goodbye", value="/welcome, /goodbye")
     embed.add_field(name="💬 DM System", value="/dm user, /dm role, /dm everyone, /dmlogs")
     embed.add_field(name="🔗 Invites", value="/invites, /inviteleaderboard, /resetinvites")
-    embed.add_field(name="🛠️ Utility", value="/giveaway, /weather, /qrcode, /remindme, /poll, /afk")
+    embed.add_field(name="🛠️ Utility", value="/giveaway, /weather, /qrcode, /remindme, /poll, /afk, /embed")
     embed.add_field(name="ℹ️ Information", value="/serverinfo, /userinfo, /ping...")
     embed.add_field(name="⚙️ Server Mngt", value="/autorole, /stickyroles, /verify, /serverstats...")
     embed.add_field(name="📢 Announcements", value="/webhook api")
@@ -808,32 +836,27 @@ bot.tree.add_command(ServerStatsGroup(name="serverstats", description="Server st
 class WebhookGroup(app_commands.Group):
     @app_commands.command(name="api", description="Send webhook message")
     async def webhook_api(self, interaction: discord.Interaction, webhook_name: str, title: str, message: str, channel: discord.TextChannel, embed_format: bool, color: str):
-        # Fetch existing webhooks in the channel
         webhooks = await channel.webhooks()
-        
-        # Look for our existing webhook to NOT make a new one every time
         webhook = discord.utils.get(webhooks, name="Vantix Webhook")
         if not webhook:
             webhook = await channel.create_webhook(name="Vantix Webhook")
         
-        # Parse the color (Default if invalid)
         parsed_color = discord.Color.default()
         try:
             if color.startswith("#"):
                 parsed_color = discord.Color(int(color[1:], 16))
-        except: 
-            pass
+        except: pass
 
-        # Send the webhook using the inputted name (webhook_name) instead of interaction.user
         if embed_format:
             embed = discord.Embed(title=title, description=message, color=parsed_color)
             await webhook.send(embed=embed, username=webhook_name)
         else:
             await webhook.send(f"**{title}**\n{message}", username=webhook_name)
         
-        await interaction.response.send_message(f"Sent webhook to {channel.mention} with the name '{webhook_name}'.", ephemeral=True)
+        await interaction.response.send_message(f"Sent webhook to {channel.mention} with name '{webhook_name}'.", ephemeral=True)
 
 bot.tree.add_command(WebhookGroup(name="webhook", description="Webhook commands"))
+
 # ==========================================
 # LIVE STATUS MONITOR (TCP/HTTP)
 # ==========================================
@@ -977,13 +1000,16 @@ class UtilityEvents(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
-        # Welcome message
+        # Welcome message Update: Embedded with "Welcome to Vantix Node"
         welcome_data = Database.get(f"guilds/{member.guild.id}/welcome")
         if welcome_data:
             ch = member.guild.get_channel(welcome_data["channel"])
             if ch:
                 msg = welcome_data["message"].replace("{user}", member.mention).replace("{server}", member.guild.name)
-                await ch.send(msg)
+                embed = discord.Embed(title="Welcome to Vantix Node", description=msg, color=discord.Color.blue())
+                if member.avatar: 
+                    embed.set_thumbnail(url=member.avatar.url)
+                await ch.send(embed=embed)
         
         # Autorole
         ar = Database.get(f"guilds/{member.guild.id}/autorole")
@@ -1028,7 +1054,6 @@ class UtilityEvents(commands.Cog):
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel):
         if Database.get(f"guilds/{channel.guild.id}/antinuke/enabled"):
-            # Very basic anit-nuke logging (for demonstration)
             logs = Database.get(f"guilds/{channel.guild.id}/security_logs") or []
             logs.append(f"[{datetime.datetime.now()}] Channel Deleted: {channel.name}")
             Database.set(f"guilds/{channel.guild.id}/security_logs", logs[-20:])
