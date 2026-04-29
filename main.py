@@ -22,6 +22,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─────────────────────────────────────────────
+#  KEEP-ALIVE (Flask — for Render / UptimeRobot)
+# ─────────────────────────────────────────────
+from flask import Flask
+from threading import Thread
+
+_flask_app = Flask(__name__)
+
+@_flask_app.route("/")
+def _health():
+    return "Vantix Management V1 is online!", 200
+
+def _run_flask():
+    port = int(os.getenv("PORT", 8080))
+    _flask_app.run(host="0.0.0.0", port=port)
+
+Thread(target=_run_flask, daemon=True).start()
+
+# ─────────────────────────────────────────────
 #  FIREBASE SETUP
 # ─────────────────────────────────────────────
 firebase_config = {
@@ -162,7 +180,7 @@ async def superadmin(interaction: discord.Interaction, action: str, user: discor
     if action == "add":
         if not user:
             return await interaction.response.send_message(embed=err_embed("Missing User"), ephemeral=True)
-        admins[str(user.id)] = {"name": str(user), "added": datetime.datetime.utcnow().isoformat()}
+        admins[str(user.id)] = {"name": str(user), "added": datetime.datetime.now(datetime.UTC).isoformat()}
         db_set("superadmins", admins)
         await interaction.response.send_message(embed=ok_embed("Super Admin Added", f"{user.mention} is now a super admin."))
     elif action == "remove":
@@ -380,7 +398,7 @@ async def warn(interaction: discord.Interaction, user: discord.Member, reason: s
     gid = interaction.guild.id
     uid = user.id
     path = f"guilds/{gid}/warnings/{uid}"
-    entry = {"reason": reason, "by": str(interaction.user), "time": datetime.datetime.utcnow().isoformat()}
+    entry = {"reason": reason, "by": str(interaction.user), "time": datetime.datetime.now(datetime.UTC).isoformat()}
     db_push(path, entry)
     warns = db_get(path) or {}
     count = len(warns)
@@ -507,7 +525,7 @@ class TicketPanelView(discord.ui.View):
         except discord.Forbidden:
             return await interaction.response.send_message(embed=err_embed("Failed", "Missing permissions to create channel."), ephemeral=True)
         db_set(f"guilds/{gid}/tickets/open/{channel.id}", {
-            "owner": str(member.id), "created": datetime.datetime.utcnow().isoformat(), "claimed_by": None
+            "owner": str(member.id), "created": datetime.datetime.now(datetime.UTC).isoformat(), "claimed_by": None
         })
         stats = db_get(f"guilds/{gid}/tickets/stats") or {"closed": 0, "opened": 0}
         stats["opened"] = int(stats.get("opened", 0)) + 1
@@ -830,7 +848,7 @@ async def dm_cmd(interaction: discord.Interaction, target: str, message: str, us
             await asyncio.sleep(0.5)
         except Exception:
             failed += 1
-    log_entry = {"by": str(interaction.user), "target": target, "sent": sent, "failed": failed, "time": datetime.datetime.utcnow().isoformat()}
+    log_entry = {"by": str(interaction.user), "target": target, "sent": sent, "failed": failed, "time": datetime.datetime.now(datetime.UTC).isoformat()}
     db_push(f"guilds/{gid}/dmlogs", log_entry)
     await interaction.followup.send(embed=ok_embed("DMs Sent", f"Sent: {sent} | Failed: {failed}"), ephemeral=True)
 
@@ -1008,7 +1026,7 @@ async def giveaway(interaction: discord.Interaction, action: str, prize: str = N
         if not prize or not duration:
             return await interaction.response.send_message(embed=err_embed("Missing Args", "Provide `prize` and `duration`."), ephemeral=True)
         ch = channel or interaction.channel
-        end_time = datetime.datetime.utcnow() + datetime.timedelta(minutes=duration)
+        end_time = datetime.datetime.now(datetime.UTC) + datetime.timedelta(minutes=duration)
         embed = discord.Embed(
             title="🎉 GIVEAWAY",
             description=f"**Prize:** {prize}\n**Winners:** {winners}\n**Ends:** <t:{int(end_time.timestamp())}:R>\n\nReact with 🎉 to enter!",
@@ -1135,7 +1153,7 @@ async def poll(interaction: discord.Interaction, question: str, option1: str, op
 @app_commands.describe(reason="AFK reason")
 async def afk(interaction: discord.Interaction, reason: str = "AFK"):
     gid = interaction.guild.id
-    db_set(f"guilds/{gid}/afk/{interaction.user.id}", {"reason": reason, "time": datetime.datetime.utcnow().isoformat()})
+    db_set(f"guilds/{gid}/afk/{interaction.user.id}", {"reason": reason, "time": datetime.datetime.now(datetime.UTC).isoformat()})
     await interaction.response.send_message(embed=ok_embed("AFK Set", f"You are now AFK: **{reason}**"))
 
 # ═══════════════════════════════════════════════════════════
@@ -1497,7 +1515,7 @@ async def update_status():
             title="📡 Service Status",
             description="\n".join(lines),
             color=0x57F287 if all("🟢" in l for l in lines) else 0xED4245,
-            timestamp=datetime.datetime.utcnow()
+            timestamp=datetime.datetime.now(datetime.UTC)
         )
         embed.set_footer(text="Last updated")
         try:
@@ -1604,7 +1622,7 @@ async def antinuke_check(guild: discord.Guild, user: discord.Member | None, even
     _action_tracker[key].append(now)
     threshold = int(config.get("threshold", 3))
     if len(_action_tracker[key]) >= threshold:
-        log_entry = {"event": event, "user": str(user.id), "time": datetime.datetime.utcnow().isoformat()}
+        log_entry = {"event": event, "user": str(user.id), "time": datetime.datetime.now(datetime.UTC).isoformat()}
         db_push(f"guilds/{gid}/antinuke/logs", log_entry)
         try:
             await user.ban(reason=f"Anti-Nuke: {event} triggered")
