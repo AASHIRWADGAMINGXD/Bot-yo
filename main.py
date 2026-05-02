@@ -2138,34 +2138,85 @@ async def call_openrouter(guild_id: int, user_id: int, user_message: str, bad_wo
                         return f"❌ OpenRouter error: {err.get('message', str(err))}"
                     return f"❌ OpenRouter error: {err}"
 
-                # Extract content — handle both standard and some edge-case formats
+                # Extract content — handle all known OpenRouter response formats
                 choices = data.get("choices")
-                if not choices or not isinstance(choices, list):
-                    print(f"[AI] No choices in response: {data}")
-                    return f"❌ AI returned no choices. Raw: {raw_text[:200]}"
+                if not choices or not isinstance(choices, list) or len(choices) == 0:
+                    print(f"[AI] No choices. Full data: {data}")
+                    return f"❌ OpenRouter returned no choices. Check your API key and model name."
 
                 first = choices[0]
-                # Standard format: choices[0].message.content
-                msg = first.get("message")
-                if msg and isinstance(msg, dict):
-                    content = msg.get("content")
-                    if content and isinstance(content, str) and content.strip():
-                        reply = content.strip()
-                        history.append({"role": "assistant", "content": reply})
-                        _ai_conversations[key] = history[-20:]
-                        return reply
+                print(f"[AI] choices[0] = {first}")
 
-                # Fallback: choices[0].text (some models)
-                text_field = first.get("text")
-                if text_field and isinstance(text_field, str) and text_field.strip():
-                    reply = text_field.strip()
-                    history.append({"role": "assistant", "content": reply})
+                # Try every known path where content can live
+                content = None
+
+                # Path 1: choices[0]["message"]["content"]  (standard OpenAI format)
+                if not content:
+                    try:
+                        c = first["message"]["content"]
+                        if c and str(c).strip():
+                            content = str(c).strip()
+                    except Exception:
+                        pass
+
+                # Path 2: choices[0]["message"]["content"] via .get()
+                if not content:
+                    try:
+                        m = first.get("message") or {}
+                        c = m.get("content")
+                        if c and str(c).strip():
+                            content = str(c).strip()
+                    except Exception:
+                        pass
+
+                # Path 3: choices[0]["text"]  (some older models)
+                if not content:
+                    try:
+                        c = first.get("text")
+                        if c and str(c).strip():
+                            content = str(c).strip()
+                    except Exception:
+                        pass
+
+                # Path 4: choices[0]["delta"]["content"]  (streaming leftovers)
+                if not content:
+                    try:
+                        c = (first.get("delta") or {}).get("content")
+                        if c and str(c).strip():
+                            content = str(c).strip()
+                    except Exception:
+                        pass
+
+                # Path 5: walk every value in the dict looking for a long string
+                if not content:
+                    def _find_str(obj, depth=0):
+                        if depth > 5:
+                            return None
+                        if isinstance(obj, str) and len(obj) > 10:
+                            return obj
+                        if isinstance(obj, dict):
+                            for v in obj.values():
+                                r = _find_str(v, depth+1)
+                                if r:
+                                    return r
+                        if isinstance(obj, list):
+                            for v in obj:
+                                r = _find_str(v, depth+1)
+                                if r:
+                                    return r
+                        return None
+                    found = _find_str(first)
+                    if found:
+                        content = found.strip()
+
+                if content:
+                    history.append({"role": "assistant", "content": content})
                     _ai_conversations[key] = history[-20:]
-                    return reply
+                    return content
 
-                # Nothing worked — return raw for debugging
-                print(f"[AI] Could not extract content from: {first}")
-                return f"❌ AI response format unrecognised. Please try again. (Debug: {str(first)[:150]})"
+                # Absolute last resort — return the raw JSON so we can debug
+                print(f"[AI] All extraction paths failed. Full response: {raw_text[:500]}")
+                return f"❌ Could not read AI response. Raw data: ```{str(first)[:300]}```"
 
     except asyncio.TimeoutError:
         return "⏱️ AI took too long to respond (45s timeout). Please try again."
