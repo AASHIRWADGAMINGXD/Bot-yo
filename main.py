@@ -1950,6 +1950,7 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             reply = await call_openrouter(gid, message.author.id, content, bad_words)
 
+        reply = reply or "❌ I couldn't generate a response. Please try again."
         chunks = [reply[i:i+1990] for i in range(0, len(reply), 1990)]
         embed = discord.Embed(
             description=chunks[0],
@@ -2120,7 +2121,12 @@ async def call_openrouter(guild_id: int, user_id: int, user_message: str, bad_wo
                     text = await resp.text()
                     return f"❌ AI error ({resp.status}): {text[:200]}"
                 data = await resp.json()
-                reply = data["choices"][0]["message"]["content"]
+                choices = data.get("choices") or []
+                if not choices:
+                    return "❌ AI returned an empty response. Please try again."
+                reply = (choices[0].get("message") or {}).get("content") or ""
+                if not reply:
+                    return "❌ AI returned an empty response. Please try again."
     except asyncio.TimeoutError:
         return "⏱️ AI took too long to respond. Please try again."
     except Exception as e:
@@ -2128,7 +2134,7 @@ async def call_openrouter(guild_id: int, user_id: int, user_message: str, bad_wo
 
     history.append({"role": "assistant", "content": reply})
     _ai_conversations[key] = history[-20:]  # keep last 20 messages
-    return reply
+    return str(reply)
 
 @tree.command(name="ai", description="Chat with Vantix AI")
 @app_commands.describe(message="Your message or question")
@@ -2145,6 +2151,8 @@ async def ai_cmd(interaction: discord.Interaction, message: str):
 
     reply = await call_openrouter(gid, interaction.user.id, message, bad_words)
 
+    # Guard against None / empty
+    reply = reply or "❌ I couldn't generate a response. Please try again."
     # Split reply if too long (Discord 2000 char limit)
     chunks = [reply[i:i+1990] for i in range(0, len(reply), 1990)]
     embed = discord.Embed(
