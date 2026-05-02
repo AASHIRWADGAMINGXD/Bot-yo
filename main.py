@@ -195,13 +195,67 @@ async def superadmin(interaction: discord.Interaction, action: str, user: discor
         lines = "\n".join(f"<@{uid}> — {v.get('name','?')}" for uid, v in admins.items())
         await interaction.response.send_message(embed=info_embed("Super Admins", lines))
 
-@tree.command(name="botconfig", description="Configure bot-wide settings")
-@app_commands.describe(setting="Setting name", value="Setting value")
-async def botconfig(interaction: discord.Interaction, setting: str, value: str):
+@tree.command(name="botconfig", description="Configure bot-wide settings (owner only)")
+@app_commands.describe(
+    action="status / about / name / view",
+    value="New value for the setting"
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="status",  value="status"),
+    app_commands.Choice(name="about",   value="about"),
+    app_commands.Choice(name="name",    value="name"),
+    app_commands.Choice(name="view",    value="view"),
+])
+async def botconfig(interaction: discord.Interaction, action: str, value: str = None):
     if not is_bot_owner(interaction.user):
-        return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
-    db_set(f"botconfig/{setting}", value)
-    await interaction.response.send_message(embed=ok_embed("Bot Config Updated", f"`{setting}` = `{value}`"))
+        return await interaction.response.send_message(embed=err_embed("No Permission", "Only the bot owner can use this."), ephemeral=True)
+
+    if action == "view":
+        cfg = db_get("botconfig") or {}
+        lines = (
+            f"**Bot Name:** {cfg.get('name', bot.user.name if bot.user else 'Vantix')}\n"
+            f"**About:** {cfg.get('about', 'Not set')}\n"
+            f"**Status Text:** {cfg.get('status_text', 'Not set')}\n"
+            f"**Status Type:** {cfg.get('status_type', 'watching')}"
+        )
+        embed = info_embed("Bot Config", lines)
+        if bot.user and bot.user.display_avatar:
+            embed.set_thumbnail(url=bot.user.display_avatar.url)
+        return await interaction.response.send_message(embed=embed)
+
+    if not value:
+        return await interaction.response.send_message(embed=err_embed("Missing Value", "Please provide a value."), ephemeral=True)
+
+    if action == "status":
+        # Format: "watching:over your server"  or just text (defaults to watching)
+        parts = value.split(":", 1)
+        if len(parts) == 2:
+            stype, stext = parts[0].strip().lower(), parts[1].strip()
+        else:
+            stype, stext = "watching", value.strip()
+        type_map = {
+            "watching":  discord.ActivityType.watching,
+            "playing":   discord.ActivityType.playing,
+            "listening": discord.ActivityType.listening,
+            "competing": discord.ActivityType.competing,
+        }
+        act_type = type_map.get(stype, discord.ActivityType.watching)
+        await bot.change_presence(activity=discord.Activity(type=act_type, name=stext))
+        db_set("botconfig/status_text", stext)
+        db_set("botconfig/status_type", stype)
+        await interaction.response.send_message(embed=ok_embed("Status Updated", f"**{stype.title()}** {stext}"))
+
+    elif action == "about":
+        db_set("botconfig/about", value)
+        await interaction.response.send_message(embed=ok_embed("About Updated", f"Bot about set to:\n{value}"))
+
+    elif action == "name":
+        try:
+            await bot.user.edit(username=value)
+            db_set("botconfig/name", value)
+            await interaction.response.send_message(embed=ok_embed("Name Updated", f"Bot name changed to **{value}**"))
+        except discord.HTTPException as e:
+            await interaction.response.send_message(embed=err_embed("Failed", f"Could not change name: {e}"), ephemeral=True)
 
 @tree.command(name="extraowner", description="Manage server extra owners")
 @app_commands.describe(action="add / remove / list", user="Target user")
@@ -475,8 +529,21 @@ async def slowmode(interaction: discord.Interaction, seconds: int, channel: disc
     await interaction.response.send_message(embed=ok_embed("Slowmode Updated", msg))
 
 # ═══════════════════════════════════════════════════════════
-#   TICKET SYSTEM
+#   TICKET SYSTEM  (Professional)
 # ═══════════════════════════════════════════════════════════
+
+async def _ticket_log(guild: discord.Guild, embed: discord.Embed):
+    """Send an embed to the ticket log channel if configured."""
+    gid = guild.id
+    config = db_get(f"guilds/{gid}/tickets/config") or {}
+    log_ch_id = config.get("log_channel")
+    if log_ch_id:
+        ch = guild.get_channel(int(log_ch_id))
+        if ch:
+            try:
+                await ch.send(embed=embed)
+            except Exception:
+                pass
 
 class TicketCloseView(discord.ui.View):
     def __init__(self):
@@ -489,14 +556,61 @@ class TicketCloseView(discord.ui.View):
         ticket_data = db_get(f"guilds/{gid}/tickets/open/{ch.id}")
         if not ticket_data:
             return await interaction.response.send_message(embed=err_embed("Not a Ticket", "This channel is not a ticket."), ephemeral=True)
-        await interaction.response.send_message(embed=info_embed("Ticket Closing", "This ticket will be archived."))
-        await asyncio.sleep(3)
+
+        owner_id = ticket_data.get("owner", "?")
+        claimed_by = ticket_data.get("claimed_by")
+        opened_at  = ticket_data.get("created", "?")[:19].replace("T", " ")
+
+        # Generate transcript
+        messages = []
+        async for msg in ch.history(limit=1000, oldest_first=True):
+            messages.append(f"[{msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {msg.author} ({msg.author.id}): {msg.content}")
+        transcript_text = "\n".join(messages)
+        buf = io.BytesIO(transcript_text.encode())
+        transcript_file = discord.File(buf, filename=f"transcript-{ch.name}.txt")
+
+        # Log embed
+        log_embed = discord.Embed(
+            title="🎫 Ticket Closed",
+            color=0xED4245,
+            timestamp=datetime.datetime.now(datetime.UTC)
+        )
+        log_embed.add_field(name="Channel",   value=ch.name, inline=True)
+        log_embed.add_field(name="Owner",     value=f"<@{owner_id}>", inline=True)
+        log_embed.add_field(name="Claimed By",value=f"<@{claimed_by}>" if claimed_by else "Unclaimed", inline=True)
+        log_embed.add_field(name="Opened At", value=opened_at, inline=True)
+        log_embed.add_field(name="Closed By", value=interaction.user.mention, inline=True)
+        log_embed.add_field(name="Messages",  value=str(len(messages)), inline=True)
+        log_embed.set_footer(text="Vantix Ticket System")
+
+        await interaction.response.send_message(embed=discord.Embed(
+            title="🔒 Closing Ticket",
+            description="Generating transcript and archiving this ticket...",
+            color=0xFEE75C
+        ))
+
+        # Update stats
         db_delete(f"guilds/{gid}/tickets/open/{ch.id}")
         stats = db_get(f"guilds/{gid}/tickets/stats") or {"closed": 0, "opened": 0}
         stats["closed"] = int(stats.get("closed", 0)) + 1
         db_set(f"guilds/{gid}/tickets/stats", stats)
+
+        # Send log with transcript
+        config = db_get(f"guilds/{gid}/tickets/config") or {}
+        log_ch_id = config.get("log_channel")
+        if log_ch_id:
+            log_ch = interaction.guild.get_channel(int(log_ch_id))
+            if log_ch:
+                try:
+                    buf2 = io.BytesIO(transcript_text.encode())
+                    tf2 = discord.File(buf2, filename=f"transcript-{ch.name}.txt")
+                    await log_ch.send(embed=log_embed, file=tf2)
+                except Exception:
+                    pass
+
+        await asyncio.sleep(3)
         try:
-            await ch.delete(reason="Ticket closed")
+            await ch.delete(reason=f"Ticket closed by {interaction.user}")
         except Exception:
             pass
 
@@ -509,76 +623,181 @@ class TicketPanelView(discord.ui.View):
         guild = interaction.guild
         gid = guild.id
         config = db_get(f"guilds/{gid}/tickets/config") or {}
+
+        # Check if user already has an open ticket
+        open_tickets = db_get(f"guilds/{gid}/tickets/open") or {}
+        for t_data in open_tickets.values():
+            if isinstance(t_data, dict) and t_data.get("owner") == str(interaction.user.id):
+                return await interaction.response.send_message(
+                    embed=err_embed("Ticket Already Open", "You already have an open ticket. Please close it before opening a new one."),
+                    ephemeral=True
+                )
+
         category_id = config.get("category_id")
         category = None
         if category_id:
             category = guild.get_channel(int(category_id))
+
         member = interaction.user
-        ticket_name = f"ticket-{member.name}-{random.randint(1000,9999)}"
+        ticket_num = (db_get(f"guilds/{gid}/tickets/stats") or {}).get("opened", 0) + 1
+        ticket_name = f"ticket-{ticket_num:04d}-{member.name[:10]}"
+
+        # Build overwrites — also add support roles if configured
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
-            member: discord.PermissionOverwrite(read_messages=True, send_messages=True),
-            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+            member: discord.PermissionOverwrite(read_messages=True, send_messages=True, attach_files=True, embed_links=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True, manage_messages=True)
         }
+        support_role_id = config.get("support_role")
+        if support_role_id:
+            srole = guild.get_role(int(support_role_id))
+            if srole:
+                overwrites[srole] = discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_messages=True)
+
         try:
-            channel = await guild.create_text_channel(ticket_name, category=category, overwrites=overwrites)
+            channel = await guild.create_text_channel(ticket_name, category=category, overwrites=overwrites, topic=f"Ticket by {member} | ID: {member.id}")
         except discord.Forbidden:
-            return await interaction.response.send_message(embed=err_embed("Failed", "Missing permissions to create channel."), ephemeral=True)
+            return await interaction.response.send_message(embed=err_embed("Failed", "I'm missing permissions to create channels."), ephemeral=True)
+
+        now_str = datetime.datetime.now(datetime.UTC).isoformat()
         db_set(f"guilds/{gid}/tickets/open/{channel.id}", {
-            "owner": str(member.id), "created": datetime.datetime.now(datetime.UTC).isoformat(), "claimed_by": None
+            "owner": str(member.id),
+            "created": now_str,
+            "claimed_by": None,
+            "number": ticket_num,
         })
         stats = db_get(f"guilds/{gid}/tickets/stats") or {"closed": 0, "opened": 0}
         stats["opened"] = int(stats.get("opened", 0)) + 1
         db_set(f"guilds/{gid}/tickets/stats", stats)
+
         view = TicketCloseView()
-        embed = discord.Embed(title="🎫 Ticket Created", description=f"Hello {member.mention}! Support will be with you shortly.\nClick the button below to close this ticket.", color=BRAND_COLOR)
-        await channel.send(member.mention, embed=embed, view=view)
-        await interaction.response.send_message(embed=ok_embed("Ticket Opened", f"Your ticket: {channel.mention}"), ephemeral=True)
+        open_embed = discord.Embed(
+            title=f"🎫 Ticket #{ticket_num:04d}",
+            description=(
+                f"**Opened by:** {member.mention}\n"
+                f"**Opened at:** <t:{int(datetime.datetime.now(datetime.UTC).timestamp())}:F>\n\n"
+                f"Welcome {member.mention}! A member of our support team will be with you shortly.\n"
+                f"Please describe your issue in detail below.\n\n"
+                f"Click **Close Ticket** when your issue is resolved."
+            ),
+            color=BRAND_COLOR,
+            timestamp=datetime.datetime.now(datetime.UTC)
+        )
+        open_embed.set_thumbnail(url=member.display_avatar.url)
+        open_embed.set_footer(text="Vantix Ticket System")
+        await channel.send(member.mention, embed=open_embed, view=view)
+
+        # Log ticket open
+        log_open = discord.Embed(
+            title="🎫 Ticket Opened",
+            color=0x57F287,
+            timestamp=datetime.datetime.now(datetime.UTC)
+        )
+        log_open.add_field(name="User",    value=f"{member} ({member.id})", inline=True)
+        log_open.add_field(name="Channel", value=channel.name, inline=True)
+        log_open.add_field(name="Ticket",  value=f"#{ticket_num:04d}", inline=True)
+        log_open.set_thumbnail(url=member.display_avatar.url)
+        log_open.set_footer(text="Vantix Ticket System")
+        await _ticket_log(guild, log_open)
+
+        await interaction.response.send_message(embed=ok_embed("Ticket Opened", f"Your ticket has been created: {channel.mention}"), ephemeral=True)
 
 @tree.command(name="ticket", description="Ticket system management")
 @app_commands.describe(
     action="setup/panel/panels/editpanel/deletepanel/closeall/add/remove/close/claim/transcript/stats/addtype/listtypes/edittype/deletetype/config",
-    option="Optional: user, panel name, or type name",
+    option="Optional: user, panel name, type name, or config key",
     value="Optional: value for the action"
 )
 async def ticket(interaction: discord.Interaction, action: str, option: str = None, value: str = None):
     gid = interaction.guild.id
+
     if action == "setup":
         if not has_admin_perm(interaction.user):
             return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
         config = db_get(f"guilds/{gid}/tickets/config") or {}
-        embed = info_embed("Ticket System Setup",
-            "**Current Config:**\n" +
-            f"Category: {config.get('category_id', 'Not set')}\n" +
-            f"Log Channel: {config.get('log_channel', 'Not set')}\n\n" +
-            "Use `/ticket config` to set values."
+
+        cat_id = config.get("category_id")
+        log_id = config.get("log_channel")
+        sup_id = config.get("support_role")
+        cat_name = "Not set"
+        log_name = "Not set"
+        sup_name = "Not set"
+        if cat_id:
+            c = interaction.guild.get_channel(int(cat_id))
+            cat_name = c.name if c else f"Deleted ({cat_id})"
+        if log_id:
+            c = interaction.guild.get_channel(int(log_id))
+            log_name = c.mention if c else f"Deleted ({log_id})"
+        if sup_id:
+            r = interaction.guild.get_role(int(sup_id))
+            sup_name = r.mention if r else f"Deleted ({sup_id})"
+
+        embed = discord.Embed(title="🎫 Ticket System Configuration", color=BRAND_COLOR, timestamp=datetime.datetime.now(datetime.UTC))
+        embed.add_field(name="📁 Category",      value=cat_name, inline=True)
+        embed.add_field(name="📋 Log Channel",   value=log_name, inline=True)
+        embed.add_field(name="👥 Support Role",  value=sup_name, inline=True)
+        embed.add_field(name="📊 Stats",
+            value=(
+                f"Total Opened: **{(db_get(f'guilds/{gid}/tickets/stats') or {}).get('opened', 0)}**\n"
+                f"Total Closed: **{(db_get(f'guilds/{gid}/tickets/stats') or {}).get('closed', 0)}**\n"
+                f"Currently Open: **{len(db_get(f'guilds/{gid}/tickets/open') or {})}**"
+            ), inline=False
         )
+        embed.add_field(name="⚙️ How to configure",
+            value=(
+                "`/ticket config category_id <channel_id>` — Set ticket category\n"
+                "`/ticket config log_channel <channel_id>` — Set log channel\n"
+                "`/ticket config support_role <role_id>` — Set support role"
+            ), inline=False
+        )
+        embed.set_footer(text="Vantix Ticket System")
         await interaction.response.send_message(embed=embed)
 
     elif action == "panel":
         if not has_admin_perm(interaction.user):
             return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
         panel_name = option or "Support"
+        desc = value or "Click the button below to open a support ticket. Our team will assist you as soon as possible."
         view = TicketPanelView()
-        embed = discord.Embed(title=f"🎫 {panel_name}", description="Click the button below to open a support ticket.", color=BRAND_COLOR)
+        embed = discord.Embed(
+            title=f"🎫 {panel_name}",
+            description=desc,
+            color=BRAND_COLOR,
+            timestamp=datetime.datetime.now(datetime.UTC)
+        )
+        embed.set_footer(text="Vantix Ticket System • Click to open a ticket")
         await interaction.channel.send(embed=embed, view=view)
-        db_set(f"guilds/{gid}/tickets/panels/{panel_name}", {"channel_id": str(interaction.channel.id)})
-        await interaction.response.send_message(embed=ok_embed("Panel Created", f"Ticket panel '{panel_name}' sent."), ephemeral=True)
+        db_set(f"guilds/{gid}/tickets/panels/{panel_name}", {
+            "channel_id": str(interaction.channel.id),
+            "description": desc,
+            "created_by": str(interaction.user.id),
+            "created_at": datetime.datetime.now(datetime.UTC).isoformat()
+        })
+        await interaction.response.send_message(embed=ok_embed("Panel Created", f"Ticket panel **{panel_name}** has been posted."), ephemeral=True)
 
     elif action == "panels":
         panels = db_get(f"guilds/{gid}/tickets/panels") or {}
         if not panels:
-            return await interaction.response.send_message(embed=info_embed("Ticket Panels", "No panels configured."))
-        lines = "\n".join(f"**{n}** — <#{v.get('channel_id','?')}>" for n, v in panels.items())
-        await interaction.response.send_message(embed=info_embed("Ticket Panels", lines))
+            return await interaction.response.send_message(embed=info_embed("Ticket Panels", "No panels have been configured yet."))
+        embed = discord.Embed(title="🎫 Ticket Panels", color=BRAND_COLOR, timestamp=datetime.datetime.now(datetime.UTC))
+        for n, v in panels.items():
+            ch_id = v.get("channel_id", "?") if isinstance(v, dict) else "?"
+            embed.add_field(name=f"📌 {n}", value=f"Channel: <#{ch_id}>", inline=False)
+        embed.set_footer(text="Vantix Ticket System")
+        await interaction.response.send_message(embed=embed)
 
     elif action == "editpanel":
         if not has_admin_perm(interaction.user):
             return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
         if not option:
-            return await interaction.response.send_message(embed=err_embed("Missing Panel Name"), ephemeral=True)
-        db_set(f"guilds/{gid}/tickets/panels/{option}/updated", value or "true")
-        await interaction.response.send_message(embed=ok_embed("Panel Updated", f"Panel `{option}` updated."))
+            return await interaction.response.send_message(embed=err_embed("Missing Panel Name", "Provide the panel name as `option`."), ephemeral=True)
+        panel = db_get(f"guilds/{gid}/tickets/panels/{option}")
+        if not panel:
+            return await interaction.response.send_message(embed=err_embed("Panel Not Found", f"No panel named `{option}`."), ephemeral=True)
+        if isinstance(panel, dict) and value:
+            panel["description"] = value
+            db_set(f"guilds/{gid}/tickets/panels/{option}", panel)
+        await interaction.response.send_message(embed=ok_embed("Panel Updated", f"Panel **{option}** has been updated."))
 
     elif action == "deletepanel":
         if not has_admin_perm(interaction.user):
@@ -586,37 +805,49 @@ async def ticket(interaction: discord.Interaction, action: str, option: str = No
         if not option:
             return await interaction.response.send_message(embed=err_embed("Missing Panel Name"), ephemeral=True)
         db_delete(f"guilds/{gid}/tickets/panels/{option}")
-        await interaction.response.send_message(embed=ok_embed("Panel Deleted", f"Panel `{option}` deleted."))
+        await interaction.response.send_message(embed=ok_embed("Panel Deleted", f"Panel **{option}** has been deleted."))
 
     elif action == "closeall":
         if not has_admin_perm(interaction.user):
             return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
         open_tickets = db_get(f"guilds/{gid}/tickets/open") or {}
         count = 0
+        await interaction.response.defer()
         for ch_id in list(open_tickets.keys()):
             ch = interaction.guild.get_channel(int(ch_id))
             if ch:
                 try:
-                    await ch.delete(reason="Close all tickets")
+                    await ch.delete(reason=f"Close all tickets — by {interaction.user}")
                     count += 1
+                    await asyncio.sleep(0.5)
                 except Exception:
                     pass
         db_delete(f"guilds/{gid}/tickets/open")
-        await interaction.response.send_message(embed=ok_embed("All Tickets Closed", f"Closed {count} tickets."))
+        log_embed = discord.Embed(title="🔒 All Tickets Closed", color=0xED4245, timestamp=datetime.datetime.now(datetime.UTC))
+        log_embed.add_field(name="Closed By", value=interaction.user.mention)
+        log_embed.add_field(name="Count", value=str(count))
+        log_embed.set_footer(text="Vantix Ticket System")
+        await _ticket_log(interaction.guild, log_embed)
+        await interaction.followup.send(embed=ok_embed("All Tickets Closed", f"Successfully closed **{count}** tickets."))
 
     elif action == "add":
         ch = interaction.channel
         ticket_data = db_get(f"guilds/{gid}/tickets/open/{ch.id}")
         if not ticket_data:
-            return await interaction.response.send_message(embed=err_embed("Not a Ticket"), ephemeral=True)
+            return await interaction.response.send_message(embed=err_embed("Not a Ticket", "This command must be used inside a ticket channel."), ephemeral=True)
         if not option:
             return await interaction.response.send_message(embed=err_embed("Missing User"), ephemeral=True)
         uid = option.strip("<@!>")
         member = interaction.guild.get_member(int(uid)) if uid.isdigit() else None
         if not member:
             return await interaction.response.send_message(embed=err_embed("User Not Found"), ephemeral=True)
-        await ch.set_permissions(member, read_messages=True, send_messages=True)
-        await interaction.response.send_message(embed=ok_embed("User Added", f"{member.mention} added to ticket."))
+        await ch.set_permissions(member, read_messages=True, send_messages=True, attach_files=True)
+        await interaction.response.send_message(embed=ok_embed("User Added", f"{member.mention} has been added to this ticket."))
+        log_e = discord.Embed(title="➕ User Added to Ticket", color=0x57F287, timestamp=datetime.datetime.now(datetime.UTC))
+        log_e.add_field(name="Ticket", value=ch.name)
+        log_e.add_field(name="Added", value=member.mention)
+        log_e.add_field(name="By", value=interaction.user.mention)
+        await _ticket_log(interaction.guild, log_e)
 
     elif action == "remove":
         ch = interaction.channel
@@ -629,27 +860,84 @@ async def ticket(interaction: discord.Interaction, action: str, option: str = No
         member = interaction.guild.get_member(int(uid)) if uid.isdigit() else None
         if not member:
             return await interaction.response.send_message(embed=err_embed("User Not Found"), ephemeral=True)
+        owner_id = ticket_data.get("owner")
+        if str(member.id) == owner_id:
+            return await interaction.response.send_message(embed=err_embed("Cannot Remove", "You cannot remove the ticket owner."), ephemeral=True)
         await ch.set_permissions(member, overwrite=None)
-        await interaction.response.send_message(embed=ok_embed("User Removed", f"{member.mention} removed from ticket."))
+        await interaction.response.send_message(embed=ok_embed("User Removed", f"{member.mention} has been removed from this ticket."))
 
     elif action == "close":
         ch = interaction.channel
         ticket_data = db_get(f"guilds/{gid}/tickets/open/{ch.id}")
         if not ticket_data:
             return await interaction.response.send_message(embed=err_embed("Not a Ticket"), ephemeral=True)
-        await interaction.response.send_message(embed=info_embed("Closing Ticket", "Deleting channel..."))
+        if not (has_mod_perm(interaction.user) or str(interaction.user.id) == ticket_data.get("owner")):
+            return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
+
+        owner_id = ticket_data.get("owner", "?")
+        claimed_by = ticket_data.get("claimed_by")
+        messages_list = []
+        async for msg in ch.history(limit=1000, oldest_first=True):
+            messages_list.append(f"[{msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {msg.author} ({msg.author.id}): {msg.content}")
+        transcript_text = "\n".join(messages_list)
+
+        log_embed = discord.Embed(title="🎫 Ticket Closed", color=0xED4245, timestamp=datetime.datetime.now(datetime.UTC))
+        log_embed.add_field(name="Channel",    value=ch.name, inline=True)
+        log_embed.add_field(name="Owner",      value=f"<@{owner_id}>", inline=True)
+        log_embed.add_field(name="Claimed By", value=f"<@{claimed_by}>" if claimed_by else "Unclaimed", inline=True)
+        log_embed.add_field(name="Closed By",  value=interaction.user.mention, inline=True)
+        log_embed.add_field(name="Messages",   value=str(len(messages_list)), inline=True)
+        log_embed.set_footer(text="Vantix Ticket System")
+
+        config = db_get(f"guilds/{gid}/tickets/config") or {}
+        log_ch_id = config.get("log_channel")
+        if log_ch_id:
+            log_ch = interaction.guild.get_channel(int(log_ch_id))
+            if log_ch:
+                try:
+                    buf = io.BytesIO(transcript_text.encode())
+                    tf = discord.File(buf, filename=f"transcript-{ch.name}.txt")
+                    await log_ch.send(embed=log_embed, file=tf)
+                except Exception:
+                    pass
+
         db_delete(f"guilds/{gid}/tickets/open/{ch.id}")
-        await asyncio.sleep(2)
-        await ch.delete(reason=f"Ticket closed by {interaction.user}")
+        stats = db_get(f"guilds/{gid}/tickets/stats") or {"closed": 0, "opened": 0}
+        stats["closed"] = int(stats.get("closed", 0)) + 1
+        db_set(f"guilds/{gid}/tickets/stats", stats)
+
+        await interaction.response.send_message(embed=discord.Embed(title="🔒 Closing Ticket", description="Archiving and deleting this channel...", color=0xFEE75C))
+        await asyncio.sleep(3)
+        try:
+            await ch.delete(reason=f"Ticket closed by {interaction.user}")
+        except Exception:
+            pass
 
     elif action == "claim":
         ch = interaction.channel
         ticket_data = db_get(f"guilds/{gid}/tickets/open/{ch.id}")
         if not ticket_data:
             return await interaction.response.send_message(embed=err_embed("Not a Ticket"), ephemeral=True)
+        if not has_mod_perm(interaction.user):
+            return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
+        if ticket_data.get("claimed_by"):
+            prev = ticket_data["claimed_by"]
+            return await interaction.response.send_message(embed=err_embed("Already Claimed", f"This ticket is already claimed by <@{prev}>."), ephemeral=True)
         ticket_data["claimed_by"] = str(interaction.user.id)
         db_set(f"guilds/{gid}/tickets/open/{ch.id}", ticket_data)
-        await interaction.response.send_message(embed=ok_embed("Ticket Claimed", f"{interaction.user.mention} claimed this ticket."))
+        await ch.edit(name=f"claimed-{ch.name.removeprefix('ticket-')}")
+        claim_embed = discord.Embed(
+            title="✋ Ticket Claimed",
+            description=f"{interaction.user.mention} has claimed this ticket and will be handling your issue.",
+            color=0x57F287,
+            timestamp=datetime.datetime.now(datetime.UTC)
+        )
+        claim_embed.set_footer(text="Vantix Ticket System")
+        await interaction.response.send_message(embed=claim_embed)
+        log_e = discord.Embed(title="✋ Ticket Claimed", color=0x57F287, timestamp=datetime.datetime.now(datetime.UTC))
+        log_e.add_field(name="Ticket", value=ch.name)
+        log_e.add_field(name="Claimed By", value=interaction.user.mention)
+        await _ticket_log(interaction.guild, log_e)
 
     elif action == "transcript":
         ch = interaction.channel
@@ -657,45 +945,70 @@ async def ticket(interaction: discord.Interaction, action: str, option: str = No
         if not ticket_data:
             return await interaction.response.send_message(embed=err_embed("Not a Ticket"), ephemeral=True)
         await interaction.response.defer()
-        messages = []
-        async for msg in ch.history(limit=500, oldest_first=True):
-            messages.append(f"[{msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {msg.author}: {msg.content}")
-        transcript = "\n".join(messages)
-        buf = io.BytesIO(transcript.encode())
+        messages_list = []
+        async for msg in ch.history(limit=1000, oldest_first=True):
+            attachments = " ".join(a.url for a in msg.attachments)
+            messages_list.append(f"[{msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {msg.author} ({msg.author.id}): {msg.content}{' | Attachments: ' + attachments if attachments else ''}")
+        transcript_text = (
+            f"VANTIX MANAGEMENT — TICKET TRANSCRIPT\n"
+            f"{'='*50}\n"
+            f"Channel : {ch.name}\n"
+            f"Owner   : {ticket_data.get('owner','?')}\n"
+            f"Opened  : {ticket_data.get('created','?')[:19]}\n"
+            f"Messages: {len(messages_list)}\n"
+            f"{'='*50}\n\n"
+        ) + "\n".join(messages_list)
+        buf = io.BytesIO(transcript_text.encode())
         file = discord.File(buf, filename=f"transcript-{ch.name}.txt")
-        await interaction.followup.send(embed=ok_embed("Transcript Generated"), file=file)
+        t_embed = discord.Embed(title="📄 Transcript Generated", color=BRAND_COLOR, timestamp=datetime.datetime.now(datetime.UTC))
+        t_embed.add_field(name="Channel",  value=ch.name)
+        t_embed.add_field(name="Messages", value=str(len(messages_list)))
+        t_embed.set_footer(text="Vantix Ticket System")
+        await interaction.followup.send(embed=t_embed, file=file)
 
     elif action == "stats":
         stats = db_get(f"guilds/{gid}/tickets/stats") or {"opened": 0, "closed": 0}
-        open_count = len(db_get(f"guilds/{gid}/tickets/open") or {})
-        await interaction.response.send_message(embed=info_embed("Ticket Stats",
-            f"**Total Opened:** {stats.get('opened',0)}\n"
-            f"**Total Closed:** {stats.get('closed',0)}\n"
-            f"**Currently Open:** {open_count}"
-        ))
+        open_data = db_get(f"guilds/{gid}/tickets/open") or {}
+        open_count = len(open_data)
+        claimed = sum(1 for v in open_data.values() if isinstance(v, dict) and v.get("claimed_by"))
+        embed = discord.Embed(title="📊 Ticket Statistics", color=BRAND_COLOR, timestamp=datetime.datetime.now(datetime.UTC))
+        embed.add_field(name="📬 Total Opened",   value=str(stats.get("opened", 0)), inline=True)
+        embed.add_field(name="📭 Total Closed",   value=str(stats.get("closed", 0)), inline=True)
+        embed.add_field(name="🔓 Currently Open", value=str(open_count),              inline=True)
+        embed.add_field(name="✋ Claimed",        value=str(claimed),                 inline=True)
+        embed.add_field(name="❓ Unclaimed",      value=str(open_count - claimed),    inline=True)
+        embed.set_footer(text="Vantix Ticket System")
+        await interaction.response.send_message(embed=embed)
 
     elif action == "addtype":
         if not has_admin_perm(interaction.user):
             return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
         if not option:
             return await interaction.response.send_message(embed=err_embed("Missing Type Name"), ephemeral=True)
-        db_set(f"guilds/{gid}/tickets/types/{option}", {"label": option, "desc": value or ""})
-        await interaction.response.send_message(embed=ok_embed("Type Added", f"Ticket type `{option}` added."))
+        db_set(f"guilds/{gid}/tickets/types/{option}", {"label": option, "desc": value or "", "emoji": "🎫"})
+        await interaction.response.send_message(embed=ok_embed("Type Added", f"Ticket type **{option}** has been added."))
 
     elif action == "listtypes":
         types = db_get(f"guilds/{gid}/tickets/types") or {}
         if not types:
-            return await interaction.response.send_message(embed=info_embed("Ticket Types", "No types configured."))
-        lines = "\n".join(f"**{n}** — {v.get('desc','')}" for n, v in types.items())
-        await interaction.response.send_message(embed=info_embed("Ticket Types", lines))
+            return await interaction.response.send_message(embed=info_embed("Ticket Types", "No ticket types configured."))
+        embed = discord.Embed(title="🎫 Ticket Types", color=BRAND_COLOR, timestamp=datetime.datetime.now(datetime.UTC))
+        for n, v in types.items():
+            desc = v.get("desc", "") if isinstance(v, dict) else ""
+            embed.add_field(name=f"{v.get('emoji', '🎫') if isinstance(v, dict) else '🎫'} {n}", value=desc or "No description", inline=False)
+        embed.set_footer(text="Vantix Ticket System")
+        await interaction.response.send_message(embed=embed)
 
     elif action == "edittype":
         if not has_admin_perm(interaction.user):
             return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
         if not option:
             return await interaction.response.send_message(embed=err_embed("Missing Type Name"), ephemeral=True)
-        db_set(f"guilds/{gid}/tickets/types/{option}/desc", value or "")
-        await interaction.response.send_message(embed=ok_embed("Type Updated", f"Type `{option}` updated."))
+        existing = db_get(f"guilds/{gid}/tickets/types/{option}") or {}
+        if isinstance(existing, dict) and value:
+            existing["desc"] = value
+            db_set(f"guilds/{gid}/tickets/types/{option}", existing)
+        await interaction.response.send_message(embed=ok_embed("Type Updated", f"Ticket type **{option}** has been updated."))
 
     elif action == "deletetype":
         if not has_admin_perm(interaction.user):
@@ -703,17 +1016,27 @@ async def ticket(interaction: discord.Interaction, action: str, option: str = No
         if not option:
             return await interaction.response.send_message(embed=err_embed("Missing Type Name"), ephemeral=True)
         db_delete(f"guilds/{gid}/tickets/types/{option}")
-        await interaction.response.send_message(embed=ok_embed("Type Deleted", f"Type `{option}` deleted."))
+        await interaction.response.send_message(embed=ok_embed("Type Deleted", f"Ticket type **{option}** has been deleted."))
 
     elif action == "config":
         if not has_admin_perm(interaction.user):
             return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
         if option and value:
             db_set(f"guilds/{gid}/tickets/config/{option}", value)
-            return await interaction.response.send_message(embed=ok_embed("Config Updated", f"`{option}` = `{value}`"))
+            friendly = {"category_id": "Category", "log_channel": "Log Channel", "support_role": "Support Role"}.get(option, option)
+            return await interaction.response.send_message(embed=ok_embed("Config Updated", f"**{friendly}** has been set to `{value}`."))
         config = db_get(f"guilds/{gid}/tickets/config") or {}
-        lines = "\n".join(f"`{k}`: {v}" for k, v in config.items()) or "No config set. Use `/ticket config key value`"
-        await interaction.response.send_message(embed=info_embed("Ticket Config", lines))
+        embed = discord.Embed(title="⚙️ Ticket Config", color=BRAND_COLOR, timestamp=datetime.datetime.now(datetime.UTC))
+        embed.add_field(name="category_id",  value=config.get("category_id", "Not set"), inline=True)
+        embed.add_field(name="log_channel",  value=f"<#{config.get('log_channel')}>" if config.get("log_channel") else "Not set", inline=True)
+        embed.add_field(name="support_role", value=f"<@&{config.get('support_role')}>" if config.get("support_role") else "Not set", inline=True)
+        embed.add_field(name="Usage", value=(
+            "`/ticket config category_id <id>` — Ticket category\n"
+            "`/ticket config log_channel <id>` — Log channel\n"
+            "`/ticket config support_role <id>` — Support role"
+        ), inline=False)
+        embed.set_footer(text="Vantix Ticket System")
+        await interaction.response.send_message(embed=embed)
 
     else:
         await interaction.response.send_message(embed=err_embed("Unknown Action", f"Unknown action: `{action}`"), ephemeral=True)
@@ -1468,6 +1791,19 @@ async def monitor_add(interaction: discord.Interaction, name: str, protocol: str
     db_set(f"guilds/{gid}/statusmonitor/services", services)
     await interaction.response.send_message(embed=ok_embed("Service Added", f"`{name}` ({protocol}://{address}:{port}) added to monitor."))
 
+@tree.command(name="monitor_remove", description="Remove a service from the status monitor")
+@app_commands.describe(name="Service name to remove")
+async def monitor_remove(interaction: discord.Interaction, name: str):
+    if not has_admin_perm(interaction.user):
+        return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
+    gid = interaction.guild.id
+    services = db_get(f"guilds/{gid}/statusmonitor/services") or {}
+    if name not in services:
+        return await interaction.response.send_message(embed=err_embed("Not Found", f"No service named `{name}` exists."), ephemeral=True)
+    services.pop(name)
+    db_set(f"guilds/{gid}/statusmonitor/services", services)
+    await interaction.response.send_message(embed=ok_embed("Service Removed", f"`{name}` has been removed from the status monitor."))
+
 async def check_tcp(address: str, port: int) -> bool:
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1598,6 +1934,34 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
+    # ── AI MENTION TRIGGER ──
+    if bot.user and bot.user.mentioned_in(message) and not message.author.bot:
+        # Strip mention from message
+        content = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
+        if not content:
+            content = "Hello! What can you help me with?"
+
+        ai_config = db_get(f"guilds/{gid}/ai") or {}
+        if not ai_config.get("enabled", True):
+            return  # AI disabled, silently ignore
+
+        bad_words = db_get(f"guilds/{gid}/badwords") or []
+
+        async with message.channel.typing():
+            reply = await call_openrouter(gid, message.author.id, content, bad_words)
+
+        chunks = [reply[i:i+1990] for i in range(0, len(reply), 1990)]
+        embed = discord.Embed(
+            description=chunks[0],
+            color=BRAND_COLOR,
+            timestamp=datetime.datetime.now(datetime.UTC)
+        )
+        embed.set_author(name="Vantix AI", icon_url=message.guild.me.display_avatar.url if message.guild else discord.Embed.Empty)
+        embed.set_footer(text=f"Replying to {message.author.display_name} • Powered by OpenRouter")
+        await message.reply(embed=embed, mention_author=False)
+        for chunk in chunks[1:]:
+            await message.channel.send(embed=discord.Embed(description=chunk, color=BRAND_COLOR))
+
 # ═══════════════════════════════════════════════════════════
 #   ANTI-NUKE EVENTS
 # ═══════════════════════════════════════════════════════════
@@ -1698,6 +2062,120 @@ async def update_server_stats():
             pass
 
 # ═══════════════════════════════════════════════════════════
+#   AI SYSTEM  (OpenRouter)
+# ═══════════════════════════════════════════════════════════
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+
+AI_SYSTEM_PROMPT = """You are Vantix AI, an intelligent assistant built into the Vantix Management Discord bot. You chat in a warm, humanised, natural tone — like a knowledgeable friend, not a robot.
+
+Rules you MUST follow every single reply:
+1. DEEP RESEARCH FIRST: Before answering, mentally gather everything you know about the topic. Summarise your findings, then give a clear, complete answer.
+2. SOURCE CITATION: Always mention credible sources (e.g. "According to Wikipedia", "Based on official docs from..."). Make it feel natural, not academic.
+3. FAKE WEBSITE WARNING: If you detect or suspect a URL or website mentioned by the user looks fake, scammy, or suspicious (random domains, lookalike domains, too-good-to-be-true offers), warn the user clearly. Example: "⚠️ Heads up — that site looks suspicious. It may be a scam and could have no real info related to the topic. Stay safe and don't enter personal details there!"
+4. BAD WORDS FILTER: If the server has bad words configured, do NOT respond to or repeat those words. If a user asks about something involving those words, politely decline: "I can't help with that in this server."
+5. BE HUMANISED: Use contractions, friendly phrasing, occasional light humour. Never sound stiff or robotic.
+6. BE HELPFUL & ACCURATE: Provide deep, well-structured answers. Use bullet points or sections when needed for clarity.
+7. KEEP IT CONCISE BUT COMPLETE: Don't write walls of text unless the topic demands it.
+"""
+
+_ai_conversations: dict = {}  # guild_id:user_id -> list of messages (last 10)
+
+async def call_openrouter(guild_id: int, user_id: int, user_message: str, bad_words: list) -> str:
+    if not OPENROUTER_API_KEY:
+        return "❌ AI is not configured. The bot owner needs to set `OPENROUTER_API_KEY` in the environment."
+
+    key = f"{guild_id}:{user_id}"
+    history = _ai_conversations.get(key, [])
+
+    # Inject bad words into system prompt
+    extra = ""
+    if bad_words:
+        extra = f"\n\nSERVER BAD WORDS (do not repeat or engage with): {', '.join(bad_words)}"
+
+    history.append({"role": "user", "content": user_message})
+
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "system", "content": AI_SYSTEM_PROMPT + extra}] + history[-10:],
+        "max_tokens": 1000,
+        "temperature": 0.75,
+    }
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://discord.com",
+                    "X-Title": "Vantix Management Bot",
+                },
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    return f"❌ AI error ({resp.status}): {text[:200]}"
+                data = await resp.json()
+                reply = data["choices"][0]["message"]["content"]
+    except asyncio.TimeoutError:
+        return "⏱️ AI took too long to respond. Please try again."
+    except Exception as e:
+        return f"❌ AI request failed: {str(e)[:200]}"
+
+    history.append({"role": "assistant", "content": reply})
+    _ai_conversations[key] = history[-20:]  # keep last 20 messages
+    return reply
+
+@tree.command(name="ai", description="Chat with Vantix AI")
+@app_commands.describe(message="Your message or question")
+async def ai_cmd(interaction: discord.Interaction, message: str):
+    gid = interaction.guild.id if interaction.guild else 0
+    # Check if AI is enabled for this guild
+    ai_config = db_get(f"guilds/{gid}/ai") or {}
+    if not ai_config.get("enabled", True):
+        return await interaction.response.send_message(embed=err_embed("AI Disabled", "The AI feature is currently disabled in this server."), ephemeral=True)
+
+    bad_words = db_get(f"guilds/{gid}/badwords") or []
+
+    await interaction.response.defer()
+
+    reply = await call_openrouter(gid, interaction.user.id, message, bad_words)
+
+    # Split reply if too long (Discord 2000 char limit)
+    chunks = [reply[i:i+1990] for i in range(0, len(reply), 1990)]
+    embed = discord.Embed(
+        description=chunks[0],
+        color=BRAND_COLOR,
+        timestamp=datetime.datetime.now(datetime.UTC)
+    )
+    embed.set_author(name="Vantix AI", icon_url=interaction.guild.me.display_avatar.url if interaction.guild else discord.Embed.Empty)
+    embed.set_footer(text=f"Asked by {interaction.user.display_name} • Powered by OpenRouter")
+    await interaction.followup.send(embed=embed)
+    for chunk in chunks[1:]:
+        await interaction.followup.send(embed=discord.Embed(description=chunk, color=BRAND_COLOR))
+
+@tree.command(name="ai_toggle", description="Enable or disable AI for this server (Admin only)")
+@app_commands.describe(action="enable or disable")
+@app_commands.choices(action=[
+    app_commands.Choice(name="enable",  value="enable"),
+    app_commands.Choice(name="disable", value="disable"),
+])
+async def ai_toggle(interaction: discord.Interaction, action: str):
+    if not has_admin_perm(interaction.user):
+        return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
+    gid = interaction.guild.id
+    enabled = action == "enable"
+    db_set(f"guilds/{gid}/ai/enabled", enabled)
+    if enabled:
+        await interaction.response.send_message(embed=ok_embed("AI Enabled", "Vantix AI is now active. Mention the bot or use `/ai` to chat."))
+    else:
+        await interaction.response.send_message(embed=ok_embed("AI Disabled", "Vantix AI has been disabled for this server."))
+
+# ═══════════════════════════════════════════════════════════
 #   BOT READY
 # ═══════════════════════════════════════════════════════════
 
@@ -1724,7 +2202,18 @@ async def on_ready():
 
     update_status.start()
     update_server_stats.start()
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="over your server | Vantix V1"))
+
+    # Restore bot status from saved config
+    cfg = db_get("botconfig") or {}
+    status_text = cfg.get("status_text", "over your server | Vantix V1")
+    status_type = cfg.get("status_type", "watching")
+    type_map = {
+        "watching":  discord.ActivityType.watching,
+        "playing":   discord.ActivityType.playing,
+        "listening": discord.ActivityType.listening,
+        "competing": discord.ActivityType.competing,
+    }
+    await bot.change_presence(activity=discord.Activity(type=type_map.get(status_type, discord.ActivityType.watching), name=status_text))
     print("[Vantix] Ready!")
 
 # ─────────────────────────────────────────────
