@@ -2088,22 +2088,24 @@ async def call_openrouter(guild_id: int, user_id: int, user_message: str, bad_wo
         return "❌ AI is not configured. The bot owner needs to set `OPENROUTER_API_KEY` in the environment."
 
     key = f"{guild_id}:{user_id}"
-    history = _ai_conversations.get(key, [])
+    history = list(_ai_conversations.get(key, []))
 
     # Inject bad words into system prompt
     extra = ""
     if bad_words:
-        extra = f"\n\nSERVER BAD WORDS (do not repeat or engage with): {', '.join(bad_words)}"
+        extra = f"\n\nSERVER BAD WORDS (never repeat, engage with, or respond to content involving): {', '.join(bad_words)}"
 
     history.append({"role": "user", "content": user_message})
 
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": [{"role": "system", "content": AI_SYSTEM_PROMPT + extra}] + history[-10:],
-        "max_tokens": 1000,
+        "max_tokens": 1024,
         "temperature": 0.75,
+        "stream": False,
     }
 
+    raw_text = ""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -2111,30 +2113,67 @@ async def call_openrouter(guild_id: int, user_id: int, user_message: str, bad_wo
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
-                    "HTTP-Referer": "https://discord.com",
+                    "HTTP-Referer": "https://discord.gg",
                     "X-Title": "Vantix Management Bot",
                 },
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientTimeout(total=45),
             ) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    return f"❌ AI error ({resp.status}): {text[:200]}"
-                data = await resp.json()
-                choices = data.get("choices") or []
-                if not choices:
-                    return "❌ AI returned an empty response. Please try again."
-                reply = (choices[0].get("message") or {}).get("content") or ""
-                if not reply:
-                    return "❌ AI returned an empty response. Please try again."
-    except asyncio.TimeoutError:
-        return "⏱️ AI took too long to respond. Please try again."
-    except Exception as e:
-        return f"❌ AI request failed: {str(e)[:200]}"
+                raw_text = await resp.text()
+                print(f"[AI] Status: {resp.status} | Raw: {raw_text[:300]}")
 
-    history.append({"role": "assistant", "content": reply})
-    _ai_conversations[key] = history[-20:]  # keep last 20 messages
-    return str(reply)
+                if resp.status != 200:
+                    return f"❌ AI error ({resp.status}): {raw_text[:300]}"
+
+                # Parse JSON safely
+                try:
+                    data = json.loads(raw_text)
+                except json.JSONDecodeError as je:
+                    return f"❌ AI returned invalid JSON: {str(je)} | Raw: {raw_text[:200]}"
+
+                # Handle OpenRouter error object
+                if "error" in data:
+                    err = data["error"]
+                    if isinstance(err, dict):
+                        return f"❌ OpenRouter error: {err.get('message', str(err))}"
+                    return f"❌ OpenRouter error: {err}"
+
+                # Extract content — handle both standard and some edge-case formats
+                choices = data.get("choices")
+                if not choices or not isinstance(choices, list):
+                    print(f"[AI] No choices in response: {data}")
+                    return f"❌ AI returned no choices. Raw: {raw_text[:200]}"
+
+                first = choices[0]
+                # Standard format: choices[0].message.content
+                msg = first.get("message")
+                if msg and isinstance(msg, dict):
+                    content = msg.get("content")
+                    if content and isinstance(content, str) and content.strip():
+                        reply = content.strip()
+                        history.append({"role": "assistant", "content": reply})
+                        _ai_conversations[key] = history[-20:]
+                        return reply
+
+                # Fallback: choices[0].text (some models)
+                text_field = first.get("text")
+                if text_field and isinstance(text_field, str) and text_field.strip():
+                    reply = text_field.strip()
+                    history.append({"role": "assistant", "content": reply})
+                    _ai_conversations[key] = history[-20:]
+                    return reply
+
+                # Nothing worked — return raw for debugging
+                print(f"[AI] Could not extract content from: {first}")
+                return f"❌ AI response format unrecognised. Please try again. (Debug: {str(first)[:150]})"
+
+    except asyncio.TimeoutError:
+        return "⏱️ AI took too long to respond (45s timeout). Please try again."
+    except aiohttp.ClientConnectorError as e:
+        return f"❌ Could not connect to OpenRouter: {str(e)[:150]}"
+    except Exception as e:
+        print(f"[AI] Unexpected error: {e} | Raw: {raw_text[:200]}")
+        return f"❌ AI request failed: {type(e).__name__}: {str(e)[:150]}"
 
 @tree.command(name="ai", description="Chat with Vantix AI")
 @app_commands.describe(message="Your message or question")
