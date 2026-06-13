@@ -2067,7 +2067,7 @@ async def update_server_stats():
 # ═══════════════════════════════════════════════════════════
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "anthropic/claude-fable-5")
 
 AI_SYSTEM_PROMPT = """You are Knowledge Pro — an AI assistant made by AashirwadGamerzz, living inside a Discord bot called Vantix Management. You are smart, helpful, and talk like a real person — not a robot or a corporate chatbot.
 
@@ -2080,7 +2080,6 @@ Before doing ANYTHING else, scan the entire message for these themes (ignore spa
 • harassment • sexual content involving minors • threatening • hate speech • hate/threatening
 • illicit activity • illicit/violent • self harm • self-harm/intent • self-harm/instructions
 • violence • violence/graphic • hacking • cracking • doxxing • phishing
-
 If ANY of these are detected → STOP. Your ONLY response is:
 "Sorry, This Is Against Our Policy! 🚫"
 Do NOT explain. Do NOT engage. Do NOT continue. Just that one line.
