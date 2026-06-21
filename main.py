@@ -1329,14 +1329,15 @@ def build_welcome_msg(template: str, member: discord.Member) -> str:
         .replace("{server}",     member.guild.name)
         .replace("{count}",      str(member.guild.member_count))
         .replace("{id}",         str(member.id))
+        .replace("{membercount}", str(member.guild.member_count))
     )
 
 @tree.command(name="welcome", description="Configure welcome messages")
 @app_commands.describe(
     action="setup / test / disable",
     channel="Channel for welcome messages",
-    message="Welcome message template — use {user} {username} {server} {count}",
-    image_url="Optional image URL to show in welcome embed"
+    message="Template — use {user} {username} {server} {count} {id} {membercount}",
+    image_url="Optional image URL to display in the welcome embed"
 )
 @app_commands.choices(action=[
     app_commands.Choice(name="setup",   value="setup"),
@@ -1357,15 +1358,21 @@ async def welcome(interaction: discord.Interaction, action: str, channel: discor
             "enabled":   True
         })
         embed = ok_embed("Welcome Setup", f"Welcome messages → {channel.mention}")
-        embed.add_field(name="Template", value=message or "Default", inline=False)
-        embed.add_field(name="Variables", value="`{user}` `{username}` `{server}` `{count}` `{id}`", inline=False)
+        embed.add_field(name="📝 Template", value=f"`{message or 'Default'}`", inline=False)
+        embed.add_field(name="🔖 Variables",
+            value="`{user}` — mention\n`{username}` — display name\n`{server}` — server name\n`{count}` — member count\n`{id}` — user ID\n`{membercount}` — same as count",
+            inline=False
+        )
         if image_url:
-            embed.add_field(name="Image", value=image_url, inline=False)
+            embed.add_field(name="🖼️ Image", value=image_url, inline=False)
+            embed.set_image(url=image_url)
+        else:
+            embed.add_field(name="🖼️ Image", value="No image set. Add one with `/welcome setup image_url: <url>`", inline=False)
         await interaction.response.send_message(embed=embed)
     elif action == "test":
         config = db_get(f"guilds/{gid}/welcome") or {}
         if not config.get("enabled"):
-            return await interaction.response.send_message(embed=err_embed("Not Configured"), ephemeral=True)
+            return await interaction.response.send_message(embed=err_embed("Not Configured", "Run `/welcome setup` first."), ephemeral=True)
         ch = interaction.guild.get_channel(int(config.get("channel", 0) or 0))
         if not ch:
             return await interaction.response.send_message(embed=err_embed("Channel Not Found"), ephemeral=True)
@@ -1373,7 +1380,7 @@ async def welcome(interaction: discord.Interaction, action: str, channel: discor
         await interaction.response.send_message(embed=ok_embed("Test Sent", f"Welcome message sent to {ch.mention}"), ephemeral=True)
     elif action == "disable":
         db_set(f"guilds/{gid}/welcome/enabled", False)
-        await interaction.response.send_message(embed=ok_embed("Welcome Disabled"))
+        await interaction.response.send_message(embed=ok_embed("Welcome Disabled", "Welcome messages are now off."))
 
 async def _send_welcome(channel: discord.TextChannel, member: discord.Member, config: dict):
     """Build and send welcome embed with optional image."""
@@ -1660,6 +1667,54 @@ async def give_invites(interaction: discord.Interaction, user: discord.Member, n
     data["uses"] = int(data.get("uses", 0)) + number
     db_set(path, data)
     await interaction.response.send_message(embed=ok_embed("Invites Given", f"Gave {number} invites to {user.mention}. Total: {data['uses']}"))
+
+# ═══════════════════════════════════════════════════════════
+#   CUSTOM COMMANDS
+# ═══════════════════════════════════════════════════════════
+
+@tree.command(name="addcmd", description="Add a custom command (trigger → response)")
+@app_commands.describe(trigger="The trigger word/phrase", response="The bot's response")
+async def addcmd(interaction: discord.Interaction, trigger: str, response: str):
+    if not has_admin_perm(interaction.user):
+        return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
+    gid = interaction.guild.id
+    trigger_key = trigger.lower().strip()
+    db_set(f"guilds/{gid}/customcmds/{trigger_key}", {
+        "response": response,
+        "added_by": str(interaction.user.id),
+        "added_at": datetime.datetime.now(datetime.UTC).isoformat()
+    })
+    embed = ok_embed("Custom Command Added",
+        f"**Trigger:** `{trigger_key}`\n**Response:** {response}"
+    )
+    embed.set_footer(text="Users can trigger this by typing the exact phrase in chat")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="removecmd", description="Remove a custom command by trigger")
+@app_commands.describe(trigger="The trigger to remove")
+async def removecmd(interaction: discord.Interaction, trigger: str):
+    if not has_admin_perm(interaction.user):
+        return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
+    gid = interaction.guild.id
+    trigger_key = trigger.lower().strip()
+    existing = db_get(f"guilds/{gid}/customcmds/{trigger_key}")
+    if not existing:
+        return await interaction.response.send_message(embed=err_embed("Not Found", f"No custom command with trigger `{trigger_key}`."), ephemeral=True)
+    db_delete(f"guilds/{gid}/customcmds/{trigger_key}")
+    await interaction.response.send_message(embed=ok_embed("Custom Command Removed", f"Trigger `{trigger_key}` has been deleted."))
+
+@tree.command(name="listcmds", description="List all custom commands for this server")
+async def listcmds(interaction: discord.Interaction):
+    gid = interaction.guild.id
+    cmds = db_get(f"guilds/{gid}/customcmds") or {}
+    if not cmds:
+        return await interaction.response.send_message(embed=info_embed("Custom Commands", "No custom commands configured. Use `/addcmd` to add one."))
+    embed = discord.Embed(title="⚡ Custom Commands", color=BRAND_COLOR, timestamp=datetime.datetime.now(datetime.UTC))
+    for trigger, data in list(cmds.items())[:25]:
+        resp = data.get("response", "?") if isinstance(data, dict) else str(data)
+        embed.add_field(name=f"`{trigger}`", value=resp[:100], inline=False)
+    embed.set_footer(text=f"Total: {len(cmds)} commands • Vantix Management V1")
+    await interaction.response.send_message(embed=embed)
 
 # ═══════════════════════════════════════════════════════════
 #   UTILITY & TOOLS
@@ -2306,7 +2361,7 @@ async def update_status():
 
         now_str   = datetime.datetime.now(datetime.UTC).isoformat()
         now_ts    = int(datetime.datetime.now(datetime.UTC).timestamp())
-        next_ts   = now_ts + 1
+        next_ts   = now_ts + 60
         embed_lines = []
         all_up = True
 
@@ -2447,6 +2502,19 @@ async def on_message(message: discord.Message):
                 pass
 
     await bot.process_commands(message)
+
+    # ── CUSTOM COMMANDS TRIGGER ──────────────────────────────
+    content_lower = message.content.lower().strip()
+    cmds = db_get(f"guilds/{gid}/customcmds") or {}
+    for trigger, data in cmds.items():
+        if content_lower == trigger or content_lower.startswith(trigger + " "):
+            resp = data.get("response", "") if isinstance(data, dict) else str(data)
+            if resp:
+                try:
+                    await message.channel.send(resp)
+                except Exception:
+                    pass
+            break
 
     # ── AI MENTION TRIGGER ──
     if bot.user and bot.user.mentioned_in(message) and not message.author.bot:
