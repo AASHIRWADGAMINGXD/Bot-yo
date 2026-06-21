@@ -545,66 +545,129 @@ async def _ticket_log(guild: discord.Guild, embed: discord.Embed):
             except Exception:
                 pass
 
+class RatingView(discord.ui.View):
+    """Rating 1–10 sent to user via DM after ticket close."""
+    def __init__(self, guild_id: int, ticket_name: str, log_ch_id: str | None):
+        super().__init__(timeout=120)
+        self.guild_id    = guild_id
+        self.ticket_name = ticket_name
+        self.log_ch_id   = log_ch_id
+        for i in range(1, 11):
+            btn = discord.ui.Button(
+                label=str(i),
+                style=discord.ButtonStyle.blurple if i <= 5 else discord.ButtonStyle.green,
+                custom_id=f"rating_{i}_{guild_id}_{ticket_name[:20]}"
+            )
+            btn.callback = self._make_callback(i)
+            self.add_item(btn)
+
+    def _make_callback(self, score: int):
+        async def callback(interaction: discord.Interaction):
+            for item in self.children:
+                item.disabled = True
+            await interaction.response.edit_message(
+                embed=ok_embed("Thanks for your rating!", f"You rated this support experience **{score}/10** ⭐"),
+                view=self
+            )
+            # Save rating
+            db_push(f"guilds/{self.guild_id}/tickets/ratings", {
+                "score":   score,
+                "ticket":  self.ticket_name,
+                "user":    str(interaction.user.id),
+                "time":    datetime.datetime.now(datetime.UTC).isoformat(),
+            })
+            # Post to log channel
+            if self.log_ch_id:
+                guild = discord.utils.get(bot.guilds, id=self.guild_id)
+                if guild:
+                    log_ch = guild.get_channel(int(self.log_ch_id))
+                    if log_ch:
+                        stars = "⭐" * score + "☆" * (10 - score)
+                        e = discord.Embed(
+                            title="⭐ Ticket Rating Received",
+                            description=f"**Ticket:** {self.ticket_name}\n**User:** {interaction.user.mention}\n**Rating:** {stars} ({score}/10)",
+                            color=0x57F287 if score >= 7 else (0xFEE75C if score >= 4 else 0xED4245),
+                            timestamp=datetime.datetime.now(datetime.UTC)
+                        )
+                        e.set_footer(text="Vantix Ticket System")
+                        try:
+                            await log_ch.send(embed=e)
+                        except Exception:
+                            pass
+            self.stop()
+        return callback
+
 class TicketCloseView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.red, custom_id="ticket_close_btn", emoji="🔒")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        ch = interaction.channel
+        ch  = interaction.channel
         gid = interaction.guild.id
         ticket_data = db_get(f"guilds/{gid}/tickets/open/{ch.id}")
         if not ticket_data:
             return await interaction.response.send_message(embed=err_embed("Not a Ticket", "This channel is not a ticket."), ephemeral=True)
 
-        owner_id = ticket_data.get("owner", "?")
+        owner_id   = ticket_data.get("owner", "?")
         claimed_by = ticket_data.get("claimed_by")
         opened_at  = ticket_data.get("created", "?")[:19].replace("T", " ")
+        config     = db_get(f"guilds/{gid}/tickets/config") or {}
+        log_ch_id  = config.get("log_channel")
 
         # Generate transcript
         messages = []
         async for msg in ch.history(limit=1000, oldest_first=True):
             messages.append(f"[{msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {msg.author} ({msg.author.id}): {msg.content}")
         transcript_text = "\n".join(messages)
-        buf = io.BytesIO(transcript_text.encode())
-        transcript_file = discord.File(buf, filename=f"transcript-{ch.name}.txt")
 
-        # Log embed
-        log_embed = discord.Embed(
-            title="🎫 Ticket Closed",
-            color=0xED4245,
-            timestamp=datetime.datetime.now(datetime.UTC)
-        )
-        log_embed.add_field(name="Channel",   value=ch.name, inline=True)
-        log_embed.add_field(name="Owner",     value=f"<@{owner_id}>", inline=True)
-        log_embed.add_field(name="Claimed By",value=f"<@{claimed_by}>" if claimed_by else "Unclaimed", inline=True)
-        log_embed.add_field(name="Opened At", value=opened_at, inline=True)
-        log_embed.add_field(name="Closed By", value=interaction.user.mention, inline=True)
-        log_embed.add_field(name="Messages",  value=str(len(messages)), inline=True)
+        log_embed = discord.Embed(title="🎫 Ticket Closed", color=0xED4245, timestamp=datetime.datetime.now(datetime.UTC))
+        log_embed.add_field(name="Channel",    value=ch.name,                                         inline=True)
+        log_embed.add_field(name="Owner",      value=f"<@{owner_id}>",                                inline=True)
+        log_embed.add_field(name="Claimed By", value=f"<@{claimed_by}>" if claimed_by else "Unclaimed", inline=True)
+        log_embed.add_field(name="Opened At",  value=opened_at,                                       inline=True)
+        log_embed.add_field(name="Closed By",  value=interaction.user.mention,                        inline=True)
+        log_embed.add_field(name="Messages",   value=str(len(messages)),                              inline=True)
         log_embed.set_footer(text="Vantix Ticket System")
 
         await interaction.response.send_message(embed=discord.Embed(
             title="🔒 Closing Ticket",
-            description="Generating transcript and archiving this ticket...",
+            description="Generating transcript and archiving...",
             color=0xFEE75C
         ))
 
-        # Update stats
         db_delete(f"guilds/{gid}/tickets/open/{ch.id}")
         stats = db_get(f"guilds/{gid}/tickets/stats") or {"closed": 0, "opened": 0}
         stats["closed"] = int(stats.get("closed", 0)) + 1
         db_set(f"guilds/{gid}/tickets/stats", stats)
 
-        # Send log with transcript
-        config = db_get(f"guilds/{gid}/tickets/config") or {}
-        log_ch_id = config.get("log_channel")
         if log_ch_id:
             log_ch = interaction.guild.get_channel(int(log_ch_id))
             if log_ch:
                 try:
                     buf2 = io.BytesIO(transcript_text.encode())
-                    tf2 = discord.File(buf2, filename=f"transcript-{ch.name}.txt")
+                    tf2  = discord.File(buf2, filename=f"transcript-{ch.name}.txt")
                     await log_ch.send(embed=log_embed, file=tf2)
+                except Exception:
+                    pass
+
+        # Send rating request to ticket owner via DM
+        rating_config = config.get("rating_system", True)
+        if rating_config:
+            owner = interaction.guild.get_member(int(owner_id)) if owner_id.isdigit() else None
+            if owner:
+                try:
+                    rating_embed = discord.Embed(
+                        title="⭐ How was your support experience?",
+                        description=(
+                            f"Your ticket **{ch.name}** in **{interaction.guild.name}** has been closed.\n\n"
+                            f"Please rate your experience from **1** (terrible) to **10** (excellent).\n"
+                            f"Your feedback helps us improve! 🙏"
+                        ),
+                        color=BRAND_COLOR
+                    )
+                    rating_embed.set_footer(text="Vantix Ticket System • Rating expires in 2 minutes")
+                    await owner.send(embed=rating_embed, view=RatingView(gid, ch.name, log_ch_id))
                 except Exception:
                     pass
 
@@ -1041,30 +1104,246 @@ async def ticket(interaction: discord.Interaction, action: str, option: str = No
     else:
         await interaction.response.send_message(embed=err_embed("Unknown Action", f"Unknown action: `{action}`"), ephemeral=True)
 
+# ── Extra standalone ticket commands ────────────────────────────────────────
+
+@tree.command(name="ticket_panel", description="Create a ticket panel")
+@app_commands.describe(
+    name="Panel name",
+    description="Panel description text",
+    poster="Show poster image yes/no",
+    type="Ticket type label (e.g. Support, Bug, Appeal)"
+)
+@app_commands.choices(poster=[
+    app_commands.Choice(name="Yes", value="yes"),
+    app_commands.Choice(name="No",  value="no"),
+])
+async def ticket_panel(interaction: discord.Interaction, name: str, description: str, poster: str = "no", type: str = "Support"):
+    if not has_admin_perm(interaction.user):
+        return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
+    gid = interaction.guild.id
+    view = TicketPanelView()
+    embed = discord.Embed(
+        title=f"🎫 {name}",
+        description=f"{description}\n\n**Type:** {type}\n\nClick the button below to open a ticket.",
+        color=BRAND_COLOR,
+        timestamp=datetime.datetime.now(datetime.UTC)
+    )
+    if poster == "yes":
+        embed.set_image(url="https://i.imgur.com/wSTFkRM.png")
+    embed.set_footer(text="Vantix Ticket System • Click to open a ticket")
+    await interaction.channel.send(embed=embed, view=view)
+    db_set(f"guilds/{gid}/tickets/panels/{name}", {
+        "channel_id":  str(interaction.channel.id),
+        "description": description,
+        "type":        type,
+        "poster":      poster,
+        "created_by":  str(interaction.user.id),
+        "created_at":  datetime.datetime.now(datetime.UTC).isoformat()
+    })
+    await interaction.response.send_message(embed=ok_embed("Panel Created", f"Panel **{name}** posted in {interaction.channel.mention}."), ephemeral=True)
+
+@tree.command(name="ticket_list_panels", description="List all ticket panels created")
+async def ticket_list_panels(interaction: discord.Interaction):
+    gid = interaction.guild.id
+    panels = db_get(f"guilds/{gid}/tickets/panels") or {}
+    if not panels:
+        return await interaction.response.send_message(embed=info_embed("Ticket Panels", "No panels have been created yet."))
+    embed = discord.Embed(title="🎫 Ticket Panels", color=BRAND_COLOR, timestamp=datetime.datetime.now(datetime.UTC))
+    for n, v in panels.items():
+        if not isinstance(v, dict): continue
+        ch_id = v.get("channel_id", "?")
+        ttype = v.get("type", "Support")
+        embed.add_field(
+            name=f"📌 {n}",
+            value=f"Channel: <#{ch_id}>\nType: {ttype}\nDescription: {v.get('description','')[:60]}",
+            inline=False
+        )
+    embed.set_footer(text="Vantix Ticket System")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="ticket_list", description="Show all currently open tickets")
+async def ticket_list(interaction: discord.Interaction):
+    if not has_mod_perm(interaction.user):
+        return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
+    gid = interaction.guild.id
+    open_tickets = db_get(f"guilds/{gid}/tickets/open") or {}
+    if not open_tickets:
+        return await interaction.response.send_message(embed=info_embed("Open Tickets", "No tickets are currently open."))
+    embed = discord.Embed(
+        title=f"🎫 Open Tickets ({len(open_tickets)})",
+        color=BRAND_COLOR,
+        timestamp=datetime.datetime.now(datetime.UTC)
+    )
+    for ch_id, data in list(open_tickets.items())[:25]:
+        if not isinstance(data, dict): continue
+        ch     = interaction.guild.get_channel(int(ch_id))
+        ch_str = ch.mention if ch else f"Deleted ({ch_id})"
+        claimed = f"<@{data['claimed_by']}>" if data.get("claimed_by") else "Unclaimed"
+        num    = data.get("number", "?")
+        embed.add_field(
+            name=f"#{num:04d} — {ch_str}" if isinstance(num, int) else f"{ch_str}",
+            value=f"Owner: <@{data.get('owner','?')}>\nClaimed: {claimed}\nOpened: {data.get('created','?')[:10]}",
+            inline=True
+        )
+    embed.set_footer(text="Vantix Ticket System")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="ticket_update", description="Manually refresh the open ticket list in this channel")
+async def ticket_update(interaction: discord.Interaction):
+    if not has_mod_perm(interaction.user):
+        return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
+    gid = interaction.guild.id
+    open_tickets = db_get(f"guilds/{gid}/tickets/open") or {}
+    # Verify channels still exist, clean up stale entries
+    stale = [ch_id for ch_id in open_tickets if not interaction.guild.get_channel(int(ch_id))]
+    for ch_id in stale:
+        del open_tickets[ch_id]
+    if stale:
+        db_set(f"guilds/{gid}/tickets/open", open_tickets)
+    embed = discord.Embed(
+        title="🔄 Ticket List Updated",
+        description=f"**Open tickets:** {len(open_tickets)}\n**Cleaned up stale:** {len(stale)}",
+        color=BRAND_COLOR,
+        timestamp=datetime.datetime.now(datetime.UTC)
+    )
+    embed.set_footer(text="Vantix Ticket System")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="ticket_stats", description="Show current ticket statistics")
+async def ticket_stats(interaction: discord.Interaction):
+    gid = interaction.guild.id
+    stats      = db_get(f"guilds/{gid}/tickets/stats")   or {"opened": 0, "closed": 0}
+    open_data  = db_get(f"guilds/{gid}/tickets/open")    or {}
+    ratings    = db_get(f"guilds/{gid}/tickets/ratings") or {}
+    open_count = len(open_data)
+    claimed    = sum(1 for v in open_data.values() if isinstance(v, dict) and v.get("claimed_by"))
+
+    # Average rating
+    scores = [v.get("score", 0) for v in ratings.values() if isinstance(v, dict)]
+    avg_rating = round(sum(scores) / len(scores), 1) if scores else 0
+
+    embed = discord.Embed(title="📊 Ticket Statistics", color=BRAND_COLOR, timestamp=datetime.datetime.now(datetime.UTC))
+    embed.add_field(name="📬 Total Opened",    value=str(stats.get("opened", 0)), inline=True)
+    embed.add_field(name="📭 Total Closed",    value=str(stats.get("closed", 0)), inline=True)
+    embed.add_field(name="🔓 Currently Open",  value=str(open_count),             inline=True)
+    embed.add_field(name="✋ Claimed",         value=str(claimed),                inline=True)
+    embed.add_field(name="❓ Unclaimed",       value=str(open_count - claimed),   inline=True)
+    embed.add_field(name="⭐ Avg Rating",      value=f"{avg_rating}/10 ({len(scores)} reviews)", inline=True)
+    embed.set_footer(text="Vantix Ticket System")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="transcript", description="Generate a transcript and send to a channel")
+@app_commands.describe(channel="Channel to send the transcript to")
+async def transcript_cmd(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    gid = interaction.guild.id
+    ch  = interaction.channel
+    ticket_data = db_get(f"guilds/{gid}/tickets/open/{ch.id}")
+    if not ticket_data:
+        return await interaction.response.send_message(embed=err_embed("Not a Ticket", "Run this inside a ticket channel."), ephemeral=True)
+    await interaction.response.defer()
+    messages_list = []
+    async for msg in ch.history(limit=1000, oldest_first=True):
+        att = " | Attachments: " + " ".join(a.url for a in msg.attachments) if msg.attachments else ""
+        messages_list.append(f"[{msg.created_at.strftime('%Y-%m-%d %H:%M:%S')}] {msg.author} ({msg.author.id}): {msg.content}{att}")
+    header = (
+        f"VANTIX MANAGEMENT — TICKET TRANSCRIPT\n{'='*50}\n"
+        f"Channel : {ch.name}\nOwner   : {ticket_data.get('owner','?')}\n"
+        f"Opened  : {ticket_data.get('created','?')[:19]}\nMessages: {len(messages_list)}\n{'='*50}\n\n"
+    )
+    text = header + "\n".join(messages_list)
+    buf  = io.BytesIO(text.encode())
+    file = discord.File(buf, filename=f"transcript-{ch.name}.txt")
+    dest = channel or ch
+    embed = discord.Embed(
+        title="📄 Transcript Generated",
+        description=f"Sent to {dest.mention}",
+        color=BRAND_COLOR,
+        timestamp=datetime.datetime.now(datetime.UTC)
+    )
+    embed.add_field(name="Channel",  value=ch.name)
+    embed.add_field(name="Messages", value=str(len(messages_list)))
+    embed.set_footer(text="Vantix Ticket System")
+    await dest.send(embed=embed, file=file)
+    if dest != ch:
+        await interaction.followup.send(embed=ok_embed("Transcript Sent", f"Transcript sent to {dest.mention}."))
+    else:
+        await interaction.followup.send(embed=ok_embed("Transcript Generated"))
+
+@tree.command(name="ticket_list_types", description="List all configured ticket types")
+async def ticket_list_types(interaction: discord.Interaction):
+    gid = interaction.guild.id
+    types = db_get(f"guilds/{gid}/tickets/types") or {}
+    if not types:
+        return await interaction.response.send_message(embed=info_embed("Ticket Types", "No ticket types configured. Use `/ticket addtype`."))
+    embed = discord.Embed(title="🏷️ Ticket Types", color=BRAND_COLOR, timestamp=datetime.datetime.now(datetime.UTC))
+    for n, v in types.items():
+        desc = v.get("desc", "") if isinstance(v, dict) else ""
+        emoji = v.get("emoji", "🎫") if isinstance(v, dict) else "🎫"
+        embed.add_field(name=f"{emoji} {n}", value=desc or "No description", inline=False)
+    embed.set_footer(text="Vantix Ticket System")
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="ticket_config", description="Configure ticket system settings")
+@app_commands.describe(
+    setting="max_per_user / welcome_message / enabled / transcript / rating_system",
+    value="Value to set"
+)
+@app_commands.choices(setting=[
+    app_commands.Choice(name="max_per_user",     value="max_per_user"),
+    app_commands.Choice(name="welcome_message",  value="welcome_message"),
+    app_commands.Choice(name="enabled",          value="enabled"),
+    app_commands.Choice(name="transcript",       value="transcript"),
+    app_commands.Choice(name="rating_system",    value="rating_system"),
+])
+async def ticket_config(interaction: discord.Interaction, setting: str, value: str):
+    if not has_admin_perm(interaction.user):
+        return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
+    gid = interaction.guild.id
+    # Coerce booleans
+    bool_settings = {"enabled", "transcript", "rating_system"}
+    if setting in bool_settings:
+        coerced = value.lower() in ("yes", "true", "enable", "on", "1")
+        db_set(f"guilds/{gid}/tickets/config/{setting}", coerced)
+        display = "✅ Enabled" if coerced else "❌ Disabled"
+    else:
+        db_set(f"guilds/{gid}/tickets/config/{setting}", value)
+        display = value
+    labels = {
+        "max_per_user":    "Max Tickets Per User",
+        "welcome_message": "Welcome Message",
+        "enabled":         "Ticket System",
+        "transcript":      "Auto Transcript on Close",
+        "rating_system":   "Rating System",
+    }
+    await interaction.response.send_message(embed=ok_embed("Ticket Config Updated", f"**{labels.get(setting, setting)}** → {display}"))
+
 # ═══════════════════════════════════════════════════════════
 #   WELCOME & GOODBYE
 # ═══════════════════════════════════════════════════════════
 
 def build_welcome_msg(template: str, member: discord.Member) -> str:
     return (template
-        .replace("{user}", member.mention)
-        .replace("{username}", str(member))
-        .replace("{server}", member.guild.name)
-        .replace("{count}", str(member.guild.member_count))
+        .replace("{user}",       member.mention)
+        .replace("{username}",   member.display_name)
+        .replace("{tag}",        str(member))
+        .replace("{server}",     member.guild.name)
+        .replace("{count}",      str(member.guild.member_count))
+        .replace("{id}",         str(member.id))
     )
 
 @tree.command(name="welcome", description="Configure welcome messages")
 @app_commands.describe(
     action="setup / test / disable",
     channel="Channel for welcome messages",
-    message="Welcome message template"
+    message="Welcome message template — use {user} {username} {server} {count}",
+    image_url="Optional image URL to show in welcome embed"
 )
 @app_commands.choices(action=[
-    app_commands.Choice(name="setup", value="setup"),
-    app_commands.Choice(name="test", value="test"),
+    app_commands.Choice(name="setup",   value="setup"),
+    app_commands.Choice(name="test",    value="test"),
     app_commands.Choice(name="disable", value="disable"),
 ])
-async def welcome(interaction: discord.Interaction, action: str, channel: discord.TextChannel = None, message: str = None):
+async def welcome(interaction: discord.Interaction, action: str, channel: discord.TextChannel = None, message: str = None, image_url: str = None):
     if not has_admin_perm(interaction.user):
         return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
     gid = interaction.guild.id
@@ -1072,37 +1351,69 @@ async def welcome(interaction: discord.Interaction, action: str, channel: discor
         if not channel:
             return await interaction.response.send_message(embed=err_embed("Missing Channel"), ephemeral=True)
         db_set(f"guilds/{gid}/welcome", {
-            "channel": str(channel.id),
-            "message": message or "Welcome to {server}, {user}! You are member #{count}.",
-            "enabled": True
+            "channel":   str(channel.id),
+            "message":   message or "Welcome to **{server}**, {user}! 🎉 You are member **#{count}**.",
+            "image_url": image_url or "",
+            "enabled":   True
         })
-        await interaction.response.send_message(embed=ok_embed("Welcome Setup", f"Welcome messages will be sent to {channel.mention}."))
+        embed = ok_embed("Welcome Setup", f"Welcome messages → {channel.mention}")
+        embed.add_field(name="Template", value=message or "Default", inline=False)
+        embed.add_field(name="Variables", value="`{user}` `{username}` `{server}` `{count}` `{id}`", inline=False)
+        if image_url:
+            embed.add_field(name="Image", value=image_url, inline=False)
+        await interaction.response.send_message(embed=embed)
     elif action == "test":
         config = db_get(f"guilds/{gid}/welcome") or {}
         if not config.get("enabled"):
             return await interaction.response.send_message(embed=err_embed("Not Configured"), ephemeral=True)
-        ch = interaction.guild.get_channel(int(config.get("channel", 0)))
+        ch = interaction.guild.get_channel(int(config.get("channel", 0) or 0))
         if not ch:
             return await interaction.response.send_message(embed=err_embed("Channel Not Found"), ephemeral=True)
-        msg = build_welcome_msg(config.get("message", "Welcome {user}!"), interaction.user)
-        await ch.send(msg)
-        await interaction.response.send_message(embed=ok_embed("Test Sent"), ephemeral=True)
+        await _send_welcome(ch, interaction.user, config)
+        await interaction.response.send_message(embed=ok_embed("Test Sent", f"Welcome message sent to {ch.mention}"), ephemeral=True)
     elif action == "disable":
         db_set(f"guilds/{gid}/welcome/enabled", False)
         await interaction.response.send_message(embed=ok_embed("Welcome Disabled"))
+
+async def _send_welcome(channel: discord.TextChannel, member: discord.Member, config: dict):
+    """Build and send welcome embed with optional image."""
+    msg_text = build_welcome_msg(config.get("message", "Welcome {user}!"), member)
+    image    = config.get("image_url", "")
+    embed    = discord.Embed(description=msg_text, color=0x57F287, timestamp=datetime.datetime.now(datetime.UTC))
+    embed.set_author(name=member.display_name, icon_url=member.display_avatar.url)
+    embed.set_thumbnail(url=member.display_avatar.url)
+    if image:
+        embed.set_image(url=image)
+    embed.set_footer(text=f"{channel.guild.name} • Member #{channel.guild.member_count}")
+    try:
+        await channel.send(embed=embed)
+    except Exception:
+        try:
+            await channel.send(msg_text)
+        except Exception:
+            pass
+
+@tree.command(name="welcome_invites", description="Track and announce invite sources in a channel")
+@app_commands.describe(channel="Channel to send invite announcements to")
+async def welcome_invites(interaction: discord.Interaction, channel: discord.TextChannel):
+    if not has_admin_perm(interaction.user):
+        return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
+    db_set(f"guilds/{interaction.guild.id}/welcome_invites_channel", str(channel.id))
+    await interaction.response.send_message(embed=ok_embed("Welcome Invites Set", f"Invite announcements will be sent to {channel.mention}.\nWhen someone joins, the inviter gets credited and a message is posted."))
 
 @tree.command(name="goodbye", description="Configure goodbye messages")
 @app_commands.describe(
     action="setup / test / disable",
     channel="Channel for goodbye messages",
-    message="Goodbye message template"
+    message="Goodbye message template",
+    image_url="Optional image URL"
 )
 @app_commands.choices(action=[
-    app_commands.Choice(name="setup", value="setup"),
-    app_commands.Choice(name="test", value="test"),
+    app_commands.Choice(name="setup",   value="setup"),
+    app_commands.Choice(name="test",    value="test"),
     app_commands.Choice(name="disable", value="disable"),
 ])
-async def goodbye(interaction: discord.Interaction, action: str, channel: discord.TextChannel = None, message: str = None):
+async def goodbye(interaction: discord.Interaction, action: str, channel: discord.TextChannel = None, message: str = None, image_url: str = None):
     if not has_admin_perm(interaction.user):
         return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
     gid = interaction.guild.id
@@ -1110,20 +1421,25 @@ async def goodbye(interaction: discord.Interaction, action: str, channel: discor
         if not channel:
             return await interaction.response.send_message(embed=err_embed("Missing Channel"), ephemeral=True)
         db_set(f"guilds/{gid}/goodbye", {
-            "channel": str(channel.id),
-            "message": message or "Goodbye {username}! We'll miss you.",
-            "enabled": True
+            "channel":   str(channel.id),
+            "message":   message or "Goodbye **{username}**! We'll miss you 👋",
+            "image_url": image_url or "",
+            "enabled":   True
         })
-        await interaction.response.send_message(embed=ok_embed("Goodbye Setup", f"Goodbye messages set to {channel.mention}."))
+        await interaction.response.send_message(embed=ok_embed("Goodbye Setup", f"Goodbye messages → {channel.mention}"))
     elif action == "test":
         config = db_get(f"guilds/{gid}/goodbye") or {}
         if not config.get("enabled"):
             return await interaction.response.send_message(embed=err_embed("Not Configured"), ephemeral=True)
-        ch = interaction.guild.get_channel(int(config.get("channel", 0)))
+        ch = interaction.guild.get_channel(int(config.get("channel", 0) or 0))
         if not ch:
             return await interaction.response.send_message(embed=err_embed("Channel Not Found"), ephemeral=True)
-        msg = build_welcome_msg(config.get("message", "Goodbye {username}!"), interaction.user)
-        await ch.send(msg)
+        msg  = build_welcome_msg(config.get("message", "Goodbye {username}!"), interaction.user)
+        embed = discord.Embed(description=msg, color=0xED4245, timestamp=datetime.datetime.now(datetime.UTC))
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.display_avatar.url)
+        if config.get("image_url"):
+            embed.set_image(url=config["image_url"])
+        await ch.send(embed=embed)
         await interaction.response.send_message(embed=ok_embed("Test Sent"), ephemeral=True)
     elif action == "disable":
         db_set(f"guilds/{gid}/goodbye/enabled", False)
@@ -1211,20 +1527,16 @@ async def on_invite_delete(invite: discord.Invite):
 @bot.event
 async def on_member_join(member: discord.Member):
     guild = member.guild
-    gid = guild.id
+    gid   = guild.id
 
-    # Welcome message
+    # ── Welcome message (with image support) ─────────────────
     config = db_get(f"guilds/{gid}/welcome") or {}
     if config.get("enabled"):
         ch = guild.get_channel(int(config.get("channel", 0) or 0))
         if ch:
-            msg = build_welcome_msg(config.get("message", "Welcome {user}!"), member)
-            try:
-                await ch.send(msg)
-            except Exception:
-                pass
+            await _send_welcome(ch, member, config)
 
-    # Auto-role
+    # ── Auto-role ─────────────────────────────────────────────
     autorole_id = db_get(f"guilds/{gid}/autorole")
     if autorole_id:
         role = guild.get_role(int(autorole_id))
@@ -1234,14 +1546,15 @@ async def on_member_join(member: discord.Member):
             except Exception:
                 pass
 
-    # Invite tracking
+    # ── Invite tracking + welcome_invites announcement ────────
+    inviter_id = None
     try:
         current_invites = await guild.invites()
         cached = invite_cache.get(gid, {})
         for inv in current_invites:
             prev = cached.get(inv.code, 0)
             if inv.uses > prev:
-                inviter_id = str(inv.inviter.id) if inv.inviter else "unknown"
+                inviter_id = str(inv.inviter.id) if inv.inviter else None
                 data = db_get(f"guilds/{gid}/invites/{inviter_id}") or {"uses": 0, "members": []}
                 data["uses"] = int(data.get("uses", 0)) + 1
                 data.setdefault("members", []).append(str(member.id))
@@ -1252,7 +1565,31 @@ async def on_member_join(member: discord.Member):
     except Exception:
         pass
 
-    # Sticky roles
+    # ── Post invite announcement if channel configured ────────
+    inv_ch_id = db_get(f"guilds/{gid}/welcome_invites_channel")
+    if inv_ch_id and inviter_id:
+        inv_ch = guild.get_channel(int(inv_ch_id))
+        if inv_ch:
+            inviter = guild.get_member(int(inviter_id))
+            inv_data = db_get(f"guilds/{gid}/invites/{inviter_id}") or {"uses": 0}
+            total_inv = int(inv_data.get("uses", 0))
+            try:
+                e = discord.Embed(
+                    title="📨 Invite Tracked!",
+                    description=(
+                        f"**{member.mention}** joined using **{inviter.mention if inviter else f'<@{inviter_id}>'}**'s invite!\n"
+                        f"{inviter.mention if inviter else f'<@{inviter_id}>'} now has **{total_inv}** invite{'s' if total_inv != 1 else ''}. 🎉"
+                    ),
+                    color=0x57F287,
+                    timestamp=datetime.datetime.now(datetime.UTC)
+                )
+                e.set_thumbnail(url=member.display_avatar.url)
+                e.set_footer(text="Vantix Invite Tracker")
+                await inv_ch.send(embed=e)
+            except Exception:
+                pass
+
+    # ── Sticky roles ──────────────────────────────────────────
     sticky = db_get(f"guilds/{gid}/stickyroles/enabled")
     if sticky:
         saved_roles = db_get(f"guilds/{gid}/stickyroles/users/{member.id}") or []
@@ -1511,16 +1848,44 @@ async def userinfo(interaction: discord.Interaction, user: discord.Member = None
     embed.set_footer(text="Vantix Management V1")
     await interaction.response.send_message(embed=embed)
 
-@tree.command(name="roleinfo", description="View role information")
+@tree.command(name="roleinfo", description="View detailed role information")
 @app_commands.describe(role="Role to inspect")
 async def roleinfo(interaction: discord.Interaction, role: discord.Role):
-    embed = discord.Embed(title=f"Role: {role.name}", color=role.color)
-    embed.add_field(name="ID", value=str(role.id))
-    embed.add_field(name="Members", value=str(len(role.members)))
-    embed.add_field(name="Color", value=str(role.color))
-    embed.add_field(name="Mentionable", value=str(role.mentionable))
-    embed.add_field(name="Hoisted", value=str(role.hoist))
-    embed.add_field(name="Created", value=role.created_at.strftime("%Y-%m-%d"))
+    # Key permissions to highlight
+    key_perms = []
+    p = role.permissions
+    if p.administrator:       key_perms.append("Administrator")
+    if p.manage_guild:        key_perms.append("Manage Server")
+    if p.manage_channels:     key_perms.append("Manage Channels")
+    if p.manage_roles:        key_perms.append("Manage Roles")
+    if p.manage_messages:     key_perms.append("Manage Messages")
+    if p.kick_members:        key_perms.append("Kick Members")
+    if p.ban_members:         key_perms.append("Ban Members")
+    if p.mention_everyone:    key_perms.append("Mention Everyone")
+    if p.moderate_members:    key_perms.append("Timeout Members")
+
+    embed = discord.Embed(
+        title=f"{'🔵' if role.color.value else '⚫'} Role Info — {role.name}",
+        color=role.color if role.color.value else BRAND_COLOR,
+        timestamp=datetime.datetime.now(datetime.UTC)
+    )
+    embed.add_field(name="🆔 Role ID",       value=f"`{role.id}`",                           inline=True)
+    embed.add_field(name="👥 Members",        value=str(len(role.members)),                   inline=True)
+    embed.add_field(name="🎨 Color",          value=str(role.color),                          inline=True)
+    embed.add_field(name="📌 Mentionable",    value="✅ Yes" if role.mentionable else "❌ No", inline=True)
+    embed.add_field(name="📋 Hoisted",        value="✅ Yes" if role.hoist else "❌ No",        inline=True)
+    embed.add_field(name="🤖 Managed/Bot",   value="✅ Yes" if role.managed else "❌ No",      inline=True)
+    embed.add_field(name="📊 Position",       value=f"#{role.position}",                      inline=True)
+    embed.add_field(name="📅 Created",        value=f"<t:{int(role.created_at.timestamp())}:D>", inline=True)
+    embed.add_field(name="🔗 Mention",        value=role.mention,                             inline=True)
+    if key_perms:
+        embed.add_field(name="🔑 Key Permissions", value="\n".join(f"• {p}" for p in key_perms), inline=False)
+    else:
+        embed.add_field(name="🔑 Key Permissions", value="No elevated permissions", inline=False)
+    if role.members:
+        sample = ", ".join(m.display_name for m in role.members[:8])
+        suffix = f" +{len(role.members)-8} more" if len(role.members) > 8 else ""
+        embed.add_field(name=f"👤 Members Preview", value=sample + suffix, inline=False)
     embed.set_footer(text="Vantix Management V1")
     await interaction.response.send_message(embed=embed)
 
@@ -1757,6 +2122,10 @@ async def webhook_cmd(interaction: discord.Interaction, title: str, message: str
 #   STATUS MONITOR
 # ═══════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════
+#   STATUS MONITOR  (Enhanced)
+# ═══════════════════════════════════════════════════════════
+
 _status_messages: dict = {}
 
 @tree.command(name="status_setup", description="Set up live status channel (run in target channel)")
@@ -1773,23 +2142,43 @@ async def status_setup(interaction: discord.Interaction):
 
 @tree.command(name="monitor_add", description="Add a service to monitor")
 @app_commands.describe(
-    name="Service name",
+    name="Service name (displayed on status)",
     protocol="tcp or http",
-    address="IP or hostname",
-    port="Port number (for TCP)"
+    address="IP or URL (e.g. example.com or https://example.com)",
+    port="Port number for TCP (default 80)",
+    hide_url="Hide the URL from the status display (yes/no)"
 )
-@app_commands.choices(protocol=[
-    app_commands.Choice(name="tcp", value="tcp"),
-    app_commands.Choice(name="http", value="http"),
-])
-async def monitor_add(interaction: discord.Interaction, name: str, protocol: str, address: str, port: int = 80):
+@app_commands.choices(
+    protocol=[
+        app_commands.Choice(name="http/https", value="http"),
+        app_commands.Choice(name="tcp",         value="tcp"),
+    ],
+    hide_url=[
+        app_commands.Choice(name="No  — show URL",  value="no"),
+        app_commands.Choice(name="Yes — hide URL",  value="yes"),
+    ]
+)
+async def monitor_add(interaction: discord.Interaction, name: str, protocol: str, address: str, port: int = 80, hide_url: str = "no"):
     if not has_admin_perm(interaction.user):
         return await interaction.response.send_message(embed=err_embed("No Permission"), ephemeral=True)
     gid = interaction.guild.id
     services = db_get(f"guilds/{gid}/statusmonitor/services") or {}
-    services[name] = {"protocol": protocol, "address": address, "port": port}
+    services[name] = {
+        "protocol": protocol,
+        "address":  address,
+        "port":     port,
+        "hide_url": hide_url == "yes",
+        "added":    datetime.datetime.now(datetime.UTC).isoformat(),
+        # stats reset on add
+        "total_checks":  0,
+        "total_up":      0,
+        "total_down":    0,
+        "online_since":  None,
+        "history":       [],   # list of {time, up, response_ms, status_code}
+    }
     db_set(f"guilds/{gid}/statusmonitor/services", services)
-    await interaction.response.send_message(embed=ok_embed("Service Added", f"`{name}` ({protocol}://{address}:{port}) added to monitor."))
+    display = address if hide_url == "no" else "**URL hidden**"
+    await interaction.response.send_message(embed=ok_embed("Service Added", f"**{name}** ({protocol}) → {display} added to monitor."))
 
 @tree.command(name="monitor_remove", description="Remove a service from the status monitor")
 @app_commands.describe(name="Service name to remove")
@@ -1799,28 +2188,107 @@ async def monitor_remove(interaction: discord.Interaction, name: str):
     gid = interaction.guild.id
     services = db_get(f"guilds/{gid}/statusmonitor/services") or {}
     if name not in services:
-        return await interaction.response.send_message(embed=err_embed("Not Found", f"No service named `{name}` exists."), ephemeral=True)
+        return await interaction.response.send_message(embed=err_embed("Not Found", f"No service named `{name}`."), ephemeral=True)
     services.pop(name)
     db_set(f"guilds/{gid}/statusmonitor/services", services)
-    await interaction.response.send_message(embed=ok_embed("Service Removed", f"`{name}` has been removed from the status monitor."))
+    await interaction.response.send_message(embed=ok_embed("Service Removed", f"`{name}` removed from monitor."))
 
-async def check_tcp(address: str, port: int) -> bool:
+@tree.command(name="monitor_status", description="View detailed stats for a monitored service")
+@app_commands.describe(name="Service name")
+async def monitor_status(interaction: discord.Interaction, name: str):
+    gid = interaction.guild.id
+    services = db_get(f"guilds/{gid}/statusmonitor/services") or {}
+    if name not in services:
+        return await interaction.response.send_message(embed=err_embed("Not Found", f"No service named `{name}`."), ephemeral=True)
+    s = services[name]
+    total   = int(s.get("total_checks", 0))
+    up      = int(s.get("total_up", 0))
+    down    = int(s.get("total_down", 0))
+    history = s.get("history") or []
+    uptime_pct = round((up / total * 100), 2) if total > 0 else 0.0
+
+    # Response times from history
+    rtimes = [h["response_ms"] for h in history if h.get("response_ms") is not None]
+    avg_rt  = round(sum(rtimes) / len(rtimes), 1) if rtimes else 0
+    curr_rt = rtimes[-1] if rtimes else 0
+
+    # Days online
+    online_since = s.get("online_since")
+    if online_since:
+        try:
+            since_dt = datetime.datetime.fromisoformat(online_since)
+            days_up  = (datetime.datetime.now(datetime.UTC) - since_dt).days
+        except Exception:
+            days_up = 0
+    else:
+        days_up = 0
+
+    last_check = history[-1]["time"][:19].replace("T", " ") if history else "Never"
+    next_check = "~60 seconds"
+
+    # Last status
+    last_up = history[-1]["up"] if history else None
+    status_str  = ("🟢 Online" if last_up else "🔴 Offline") if last_up is not None else "⚪ Unknown"
+    last_code   = history[-1].get("status_code", "N/A") if history else "N/A"
+
+    embed = discord.Embed(
+        title=f"📡 Monitor — {name}",
+        color=0x57F287 if last_up else 0xED4245,
+        timestamp=datetime.datetime.now(datetime.UTC)
+    )
+    if not s.get("hide_url"):
+        embed.add_field(name="🌐 URL / Address", value=f"`{s.get('address')}`", inline=False)
+    embed.add_field(name="📶 Current Status",   value=status_str,           inline=True)
+    embed.add_field(name="🔢 Status Code",      value=str(last_code),       inline=True)
+    embed.add_field(name="⚡ Response Time",    value=f"{curr_rt} ms",      inline=True)
+    embed.add_field(name="📊 Avg Response",     value=f"{avg_rt} ms",       inline=True)
+    embed.add_field(name="✅ Uptime %",         value=f"{uptime_pct}%",     inline=True)
+    embed.add_field(name="📅 Days Online",      value=f"{days_up} days",    inline=True)
+    embed.add_field(name="🔍 Total Checks",     value=str(total),           inline=True)
+    embed.add_field(name="🕐 Last Check",       value=last_check,           inline=True)
+    embed.add_field(name="⏭️ Next Check",       value=next_check,           inline=True)
+
+    # Last 10 history
+    if history:
+        hist_lines = []
+        for h in list(reversed(history))[:10]:
+            icon = "🟢" if h.get("up") else "🔴"
+            t    = h.get("time", "?")[:19].replace("T", " ")
+            ms   = h.get("response_ms", "?")
+            code = h.get("status_code", "?")
+            hist_lines.append(f"{icon} `{t}` — {ms}ms | HTTP {code}")
+        embed.add_field(name="📜 Last 10 Checks", value="\n".join(hist_lines), inline=False)
+
+    embed.set_footer(text="Vantix Monitor • Updates every 60s")
+    await interaction.response.send_message(embed=embed)
+
+async def check_tcp(address: str, port: int):
+    """Returns (up: bool, response_ms: float)"""
+    start = time.time()
     try:
+        loop = asyncio.get_event_loop()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(5)
-        result = sock.connect_ex((address, port))
+        result = await loop.run_in_executor(None, lambda: sock.connect_ex((address, port)))
         sock.close()
-        return result == 0
+        ms = round((time.time() - start) * 1000, 1)
+        return result == 0, ms, None
     except Exception:
-        return False
+        ms = round((time.time() - start) * 1000, 1)
+        return False, ms, None
 
-async def check_http(address: str) -> bool:
+async def check_http(address: str):
+    """Returns (up: bool, response_ms: float, status_code: int)"""
+    start = time.time()
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(address, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                return resp.status < 500
+            async with session.get(address, timeout=aiohttp.ClientTimeout(total=8), allow_redirects=True) as resp:
+                ms   = round((time.time() - start) * 1000, 1)
+                up   = resp.status < 500
+                return up, ms, resp.status
     except Exception:
-        return False
+        ms = round((time.time() - start) * 1000, 1)
+        return False, ms, None
 
 @tasks.loop(seconds=60)
 async def update_status():
@@ -1829,31 +2297,77 @@ async def update_status():
         config = db_get(f"guilds/{gid}/statusmonitor") or {}
         if not config.get("channel") or not config.get("message"):
             continue
-        services = config.get("services") or {}
+        services = db_get(f"guilds/{gid}/statusmonitor/services") or {}
         if not services:
             continue
         ch = guild.get_channel(int(config["channel"]))
         if not ch:
             continue
-        lines = []
+
+        now_str   = datetime.datetime.now(datetime.UTC).isoformat()
+        now_ts    = int(datetime.datetime.now(datetime.UTC).timestamp())
+        next_ts   = now_ts + 60
+        embed_lines = []
+        all_up = True
+
         for name, info in services.items():
-            proto = info.get("protocol", "tcp")
-            addr = info.get("address", "")
-            port = int(info.get("port", 80))
+            proto   = info.get("protocol", "http")
+            addr    = info.get("address", "")
+            port    = int(info.get("port", 80))
+            hide    = info.get("hide_url", False)
+
             if proto == "tcp":
-                up = await check_tcp(addr, port)
+                up, ms, code = await check_tcp(addr, port)
             else:
-                url = addr if addr.startswith("http") else f"http://{addr}"
-                up = await check_http(url)
-            status_icon = "🟢 Online" if up else "🔴 Offline"
-            lines.append(f"**{name}** — {status_icon}")
+                url = addr if addr.startswith("http") else f"https://{addr}"
+                up, ms, code = await check_http(url)
+
+            if not up:
+                all_up = False
+
+            # Update service stats
+            info["total_checks"]  = int(info.get("total_checks", 0)) + 1
+            info["total_up"]      = int(info.get("total_up", 0)) + (1 if up else 0)
+            info["total_down"]    = int(info.get("total_down", 0)) + (0 if up else 1)
+
+            # Track when it first came online
+            if up and not info.get("online_since"):
+                info["online_since"] = now_str
+            elif not up:
+                info["online_since"] = None
+
+            # History (keep last 100)
+            history = info.get("history") or []
+            history.append({"time": now_str, "up": up, "response_ms": ms, "status_code": code})
+            info["history"] = history[-100:]
+
+            services[name] = info
+
+            # Build display line
+            total   = int(info["total_checks"])
+            up_cnt  = int(info["total_up"])
+            uptime  = round(up_cnt / total * 100, 1) if total > 0 else 0
+            status  = "🟢 **Online**" if up else "🔴 **Offline**"
+            url_str = f"`{addr}`" if not hide else "*(URL hidden)*"
+
+            embed_lines.append(
+                f"{status} — **{name}**\n"
+                f"╰ {url_str} | `{ms}ms` | HTTP `{code or 'N/A'}` | Uptime `{uptime}%`"
+            )
+
+        # Save updated service data
+        db_set(f"guilds/{gid}/statusmonitor/services", services)
+
         embed = discord.Embed(
-            title="📡 Service Status",
-            description="\n".join(lines),
-            color=0x57F287 if all("🟢" in l for l in lines) else 0xED4245,
+            title="📡 Service Status Monitor",
+            description="\n\n".join(embed_lines),
+            color=0x57F287 if all_up else 0xED4245,
             timestamp=datetime.datetime.now(datetime.UTC)
         )
-        embed.set_footer(text="Last updated")
+        embed.add_field(name="🕐 Last Checked",  value=f"<t:{now_ts}:R>",  inline=True)
+        embed.add_field(name="⏭️ Next Check",    value=f"<t:{next_ts}:R>", inline=True)
+        embed.set_footer(text="Vantix Monitor • Auto-updates every 60s")
+
         try:
             msg = await ch.fetch_message(int(config["message"]))
             await msg.edit(embed=embed)
@@ -2067,7 +2581,7 @@ async def update_server_stats():
 # ═══════════════════════════════════════════════════════════
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "anthropic/claude-fable-5")
+OPENROUTER_MODEL   = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini")
 
 AI_SYSTEM_PROMPT = """You are Knowledge Pro — an AI assistant made by AashirwadGamerzz, living inside a Discord bot called Vantix Management. You are smart, helpful, and talk like a real person — not a robot or a corporate chatbot.
 
@@ -2080,6 +2594,7 @@ Before doing ANYTHING else, scan the entire message for these themes (ignore spa
 • harassment • sexual content involving minors • threatening • hate speech • hate/threatening
 • illicit activity • illicit/violent • self harm • self-harm/intent • self-harm/instructions
 • violence • violence/graphic • hacking • cracking • doxxing • phishing
+
 If ANY of these are detected → STOP. Your ONLY response is:
 "Sorry, This Is Against Our Policy! 🚫"
 Do NOT explain. Do NOT engage. Do NOT continue. Just that one line.
