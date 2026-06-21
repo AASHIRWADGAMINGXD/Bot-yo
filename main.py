@@ -2306,7 +2306,7 @@ async def update_status():
 
         now_str   = datetime.datetime.now(datetime.UTC).isoformat()
         now_ts    = int(datetime.datetime.now(datetime.UTC).timestamp())
-        next_ts   = now_ts + 60
+        next_ts   = now_ts + 1
         embed_lines = []
         all_up = True
 
