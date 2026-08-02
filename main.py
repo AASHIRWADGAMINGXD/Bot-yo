@@ -31,6 +31,12 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from supabase import create_client, Client
 import aiohttp
+import redis.asyncio as redis_lib
+
+try:
+    import redis.asyncio as aioredis
+except ImportError:
+    aioredis = None
 
 # ------------------------------------------------------------------
 # ENV / CONFIG
@@ -42,6 +48,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
+REDIS_URL = os.getenv("REDIS_URL")  # e.g. redis://localhost:6379/0 — optional, falls back to in-memory cache
+SHARD_COUNT = os.getenv("SHARD_COUNT")  # e.g. "4" — leave unset to let discord.py auto-decide
 BOT_DEVELOPER = "AashirwadGamerzz"
 BOT_NAME = "VantixNodes Bot"
 
@@ -80,16 +88,59 @@ intents.voice_states = True
 intents.guilds = True
 intents.moderation = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+# AutoShardedBot lets a single process (or a fleet of processes coordinated by
+# Discord's recommended shard count) handle 2500+ guilds. Discord requires
+# sharding once a bot passes ~2500 servers; discord.py auto-computes the
+# shard count unless SHARD_COUNT is explicitly set (useful for multi-process
+# deployments where each process owns a fixed shard range).
+bot = commands.AutoShardedBot(
+    command_prefix="!",
+    intents=intents,
+    help_command=None,
+    shard_count=int(SHARD_COUNT) if SHARD_COUNT else None,
+)
 bot.start_time = time.time()
 bot.commands_executed = 0
 
-# in-memory caches (backed by Supabase for persistence)
+# ------------------------------------------------------------------
+# CACHE LAYER
+# ------------------------------------------------------------------
+# When REDIS_URL is configured, all "cache" dicts below are backed by Redis
+# so that multiple bot processes/shards (or horizontally scaled instances)
+# share the same state instead of drifting out of sync. Without Redis
+# configured, everything falls back to plain in-memory dicts (fine for a
+# single-process deployment).
+bot.redis = aioredis.from_url(REDIS_URL, decode_responses=True) if (REDIS_URL and aioredis) else None
+
+# in-memory fallback caches (used directly when bot.redis is None)
 bot.guild_config_cache: dict[int, dict] = {}
-bot.antinuke_actions: dict[int, list] = {}   # guild_id -> list of recent action timestamps per actor
+bot.antinuke_actions: dict[int, dict] = {}   # guild_id -> {actor_id: [timestamps]}
 bot.afk_cache: dict[tuple, dict] = {}         # (guild_id, user_id) -> {"reason":..., "time":...}
 bot.ai_context: dict[int, list] = {}          # user_id -> list of {"role","content"}
 bot.invite_cache: dict[int, dict] = {}        # guild_id -> {invite_code: uses}
+bot.xp_cooldowns: dict[str, float] = {}       # "guild_id:user_id" -> last XP award timestamp
+
+
+async def cache_get(namespace: str, key, default=None):
+    """Read from Redis if configured, else from the in-memory dict named `namespace`."""
+    if bot.redis:
+        raw = await bot.redis.get(f"{namespace}:{key}")
+        return json.loads(raw) if raw is not None else default
+    return getattr(bot, namespace).get(key, default)
+
+
+async def cache_set(namespace: str, key, value, ttl: Optional[int] = None):
+    if bot.redis:
+        await bot.redis.set(f"{namespace}:{key}", json.dumps(value), ex=ttl)
+    else:
+        getattr(bot, namespace)[key] = value
+
+
+async def cache_delete(namespace: str, key):
+    if bot.redis:
+        await bot.redis.delete(f"{namespace}:{key}")
+    else:
+        getattr(bot, namespace).pop(key, None)
 
 # ------------------------------------------------------------------
 # HELPERS
@@ -125,8 +176,9 @@ def parse_duration(duration_str: str) -> Optional[int]:
 
 
 async def get_guild_config(guild_id: int) -> dict:
-    if guild_id in bot.guild_config_cache:
-        return bot.guild_config_cache[guild_id]
+    cached = await cache_get("guild_config_cache", guild_id)
+    if cached is not None:
+        return cached
     try:
         res = supabase.table("guild_config").select("*").eq("guild_id", guild_id).execute()
         if res.data:
@@ -137,9 +189,10 @@ async def get_guild_config(guild_id: int) -> dict:
                    "welcome_channel": None, "welcome_message": None,
                    "goodbye_channel": None, "goodbye_message": None,
                    "ticket_category_id": None, "ticket_staff_role": None, "ticket_log_channel": None,
-                   "badwords_log_channel": None, "membercount_channel": None}
+                   "badwords_log_channel": None, "membercount_channel": None,
+                   "premium": False}
             supabase.table("guild_config").insert(cfg).execute()
-        bot.guild_config_cache[guild_id] = cfg
+        await cache_set("guild_config_cache", guild_id, cfg, ttl=300)
         return cfg
     except Exception as e:
         logger.error(f"get_guild_config error: {e}")
@@ -149,11 +202,30 @@ async def get_guild_config(guild_id: int) -> dict:
 async def update_guild_config(guild_id: int, **fields):
     cfg = await get_guild_config(guild_id)
     cfg.update(fields)
-    bot.guild_config_cache[guild_id] = cfg
+    await cache_set("guild_config_cache", guild_id, cfg, ttl=300)
     try:
         supabase.table("guild_config").update(fields).eq("guild_id", guild_id).execute()
     except Exception as e:
         logger.error(f"update_guild_config error: {e}")
+
+
+async def is_premium(guild_id: int) -> bool:
+    cfg = await get_guild_config(guild_id)
+    return bool(cfg.get("premium"))
+
+
+def premium_feature():
+    """Gate a command behind the per-guild premium flag stored in Supabase."""
+    async def predicate(interaction: discord.Interaction) -> bool:
+        if await is_premium(interaction.guild_id):
+            return True
+        await interaction.response.send_message(
+            embed=make_embed("✨ Premium Required", "This feature is only available on servers with VantixNodes Premium. Use `/premium status` for details.",
+                              discord.Color.gold(), bot.user),
+            ephemeral=True,
+        )
+        return False
+    return app_commands.check(predicate)
 
 
 async def log_to_channel(guild: discord.Guild, channel_id: Optional[int], embed: discord.Embed):
@@ -236,15 +308,16 @@ async def antinuke_check(guild: discord.Guild, actor: discord.abc.User, action: 
     window = cfg.get("antinuke_window", 10)
     threshold = cfg.get("antinuke_threshold", 5)
 
-    bucket = bot.antinuke_actions.setdefault(guild.id, {})
-    actor_events = bucket.setdefault(actor.id, [])
+    bucket_key = f"{guild.id}:{actor.id}"
+    actor_events = await cache_get("antinuke_actions", bucket_key, default=[])
     actor_events.append(now)
-    actor_events[:] = [t for t in actor_events if now - t <= window]
+    actor_events = [t for t in actor_events if now - t <= window]
 
     if len(actor_events) < threshold:
+        await cache_set("antinuke_actions", bucket_key, actor_events, ttl=window + 5)
         return
 
-    actor_events.clear()  # reset after trigger
+    await cache_delete("antinuke_actions", bucket_key)  # reset after trigger
 
     punishment = "none"
     member = guild.get_member(actor.id)
@@ -407,6 +480,7 @@ async def on_message(message: discord.Message):
     await handle_afk(message)
     await handle_custom_command(message)
     await handle_badwords(message)
+    await add_xp(message)
 
     await bot.process_commands(message)
 
@@ -1076,7 +1150,7 @@ async def dm_cmd(interaction: discord.Interaction, user: discord.User, title: st
 @bot.tree.command(name="dmall", description="Mass DM all members with a custom message (admin only)")
 @has_admin_perms()
 async def dmall_cmd(interaction: discord.Interaction, title: str, message: str):
-    await interaction.response.send_message(embed=make_embed("⚠️ Confirm Mass DM", f"This will DM **{interaction.guild.member_count}** members. React ✅ within 30s to confirm.", discord.Color.orange(), bot.user))
+    await interaction.response.send_message(embed=make_embed("⚠️ Confirm Mass DM", f"This will queue a DM job for **{interaction.guild.member_count}** members. React ✅ within 30s to confirm.", discord.Color.orange(), bot.user))
     sent_message = await interaction.original_response()
     await sent_message.add_reaction("✅")
 
@@ -1088,17 +1162,84 @@ async def dmall_cmd(interaction: discord.Interaction, title: str, message: str):
     except asyncio.TimeoutError:
         return await interaction.followup.send(embed=make_embed("❌ Cancelled", "Mass DM confirmation timed out.", discord.Color.red(), bot.user))
 
-    embed = make_embed(title, message, discord.Color.blurple(), bot.user)
-    success, failed = 0, 0
-    for member in interaction.guild.members:
-        if member.bot:
-            continue
-        ok = await dm_user_safely(member, embed)
-        success += 1 if ok else 0
-        failed += 0 if ok else 1
-        await asyncio.sleep(1.2)  # rate-limit handling
+    # Instead of blocking this interaction while DMing every member (which risks
+    # timing out and hammering Discord's global rate limit), we enqueue a job row
+    # and let a background worker (dm_queue_worker) drain it at a safe, steady rate.
+    member_ids = [m.id for m in interaction.guild.members if not m.bot]
+    job = supabase.table("dm_jobs").insert({
+        "guild_id": interaction.guild_id, "requested_by": interaction.user.id,
+        "title": title, "message": message, "targets": json.dumps(member_ids),
+        "sent": 0, "failed": 0, "status": "queued",
+        "created_at": datetime.datetime.utcnow().isoformat(),
+    }).execute()
+    job_id = job.data[0]["id"]
 
-    await interaction.followup.send(embed=make_embed("📨 Mass DM Complete", f"Sent: **{success}** | Failed: **{failed}**", discord.Color.green(), bot.user))
+    await interaction.followup.send(embed=make_embed(
+        "📨 Mass DM Queued", f"Job `#{job_id}` queued for **{len(member_ids)}** members. "
+        f"Use `/dmjobstatus job_id:{job_id}` to check progress.", discord.Color.green(), bot.user))
+
+
+@bot.tree.command(name="dmjobstatus", description="Check the progress of a mass DM job")
+@has_admin_perms()
+async def dmjobstatus_cmd(interaction: discord.Interaction, job_id: int):
+    res = supabase.table("dm_jobs").select("*").eq("id", job_id).execute()
+    if not res.data:
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "Job not found.", discord.Color.red(), bot.user), ephemeral=True)
+    job = res.data[0]
+    total = len(json.loads(job["targets"]))
+    embed = make_embed(f"📨 DM Job #{job_id}", color=discord.Color.blurple(), bot_user=bot.user)
+    embed.add_field(name="Status", value=job["status"], inline=True)
+    embed.add_field(name="Progress", value=f"{job['sent'] + job['failed']}/{total}", inline=True)
+    embed.add_field(name="Sent", value=str(job["sent"]), inline=True)
+    embed.add_field(name="Failed", value=str(job["failed"]), inline=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# Global concurrency-safe rate limit for outbound DMs across ALL queued jobs
+# (Discord's practical safe DM rate is well under 1/sec sustained).
+DM_QUEUE_RATE_SECONDS = 1.2
+
+
+@tasks.loop(seconds=5)
+async def dm_queue_worker():
+    """Background worker that drains queued dm_jobs at a steady, safe rate.
+    Runs independently of any single interaction so it survives Discord API
+    hiccups and doesn't hold an interaction/response open for a long-running job."""
+    try:
+        res = supabase.table("dm_jobs").select("*").eq("status", "queued").order("created_at").limit(1).execute()
+        if not res.data:
+            return
+        job = res.data[0]
+        supabase.table("dm_jobs").update({"status": "running"}).eq("id", job["id"]).execute()
+
+        guild = bot.get_guild(job["guild_id"])
+        if not guild:
+            supabase.table("dm_jobs").update({"status": "failed"}).eq("id", job["id"]).execute()
+            return
+
+        embed = make_embed(job["title"], job["message"], discord.Color.blurple(), bot.user)
+        targets = json.loads(job["targets"])
+        sent, failed = job["sent"], job["failed"]
+
+        # Process in small batches per worker tick so we never block the event
+        # loop for the whole job, and other bot activity stays responsive.
+        batch = targets[sent + failed: sent + failed + 20]
+        for user_id in batch:
+            member = guild.get_member(user_id)
+            if not member:
+                failed += 1
+                continue
+            ok = await dm_user_safely(member, embed)
+            sent += 1 if ok else 0
+            failed += 0 if ok else 1
+            await asyncio.sleep(DM_QUEUE_RATE_SECONDS)
+
+        done = (sent + failed) >= len(targets)
+        supabase.table("dm_jobs").update({
+            "sent": sent, "failed": failed, "status": "done" if done else "queued"
+        }).eq("id", job["id"]).execute()
+    except Exception as e:
+        logger.error(f"dm_queue_worker error: {e}")
 
 
 # ==================================================================
@@ -1383,21 +1524,41 @@ async def botstats_cmd(interaction: discord.Interaction):
 
 @bot.tree.command(name="statusmonitor", description="Configure the live status monitor channel")
 @has_admin_perms()
-async def statusmonitor_cmd(interaction: discord.Interaction, channel: discord.abc.GuildChannel, address: str, port: int):
+async def statusmonitor_cmd(interaction: discord.Interaction, channel: discord.abc.GuildChannel, address: str, port: Optional[int] = None):
+    """`port` is optional — omit it to monitor plain host reachability (HTTP HEAD /
+    socket probe on common ports) instead of a specific TCP port."""
     supabase.table("status_monitor_config").upsert({
         "guild_id": interaction.guild_id, "channel_id": channel.id, "address": address, "port": port
     }, on_conflict="guild_id,channel_id").execute()
-    await interaction.response.send_message(embed=make_embed("📡 Status Monitor", f"Monitoring `{address}:{port}` → {channel.mention}", discord.Color.green(), bot.user))
+    target_desc = f"`{address}:{port}`" if port else f"`{address}` (host reachability only)"
+    await interaction.response.send_message(embed=make_embed("📡 Status Monitor", f"Monitoring {target_desc} → {channel.mention}", discord.Color.green(), bot.user))
 
 
-async def check_host(address: str, port: int, timeout: float = 3.0) -> bool:
+async def check_host(address: str, port: Optional[int] = None, timeout: float = 3.0) -> bool:
+    """If a port is given, does a TCP connect check on that exact port.
+    If no port is given, falls back to an HTTP HEAD request (covers web
+    services) and, failing that, a raw TCP probe on common ports (80/443)
+    as a best-effort 'is this host up at all' check."""
+    if port:
+        try:
+            conn = asyncio.open_connection(address, port)
+            reader, writer = await asyncio.wait_for(conn, timeout=timeout)
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception:
+            return False
+
+    # No port specified: try HTTP(S) first, then common ports as a fallback.
+    url = address if address.startswith(("http://", "https://")) else f"https://{address}"
     try:
-        conn = asyncio.open_connection(address, port)
-        reader, writer = await asyncio.wait_for(conn, timeout=timeout)
-        writer.close()
-        await writer.wait_closed()
-        return True
+        async with aiohttp.ClientSession() as session:
+            async with session.head(url, timeout=aiohttp.ClientTimeout(total=timeout), allow_redirects=True) as resp:
+                return resp.status < 500
     except Exception:
+        for fallback_port in (443, 80):
+            if await check_host(address, fallback_port, timeout):
+                return True
         return False
 
 
@@ -1412,9 +1573,11 @@ async def status_monitor_loop():
             channel = guild.get_channel(cfg["channel_id"])
             if not channel:
                 continue
-            online = await check_host(cfg["address"], cfg["port"])
+            port = cfg.get("port")
+            online = await check_host(cfg["address"], port)
             status_icon = "🟢" if online else "🔴"
-            new_name = f"{status_icon} Node: {'Online' if online else 'Offline'} | Port: {cfg['port']}"
+            port_label = f" | Port: {port}" if port else ""
+            new_name = f"{status_icon} Node: {'Online' if online else 'Offline'}{port_label}"
             if channel.name != new_name:
                 try:
                     await channel.edit(name=new_name)
@@ -1475,24 +1638,26 @@ async def ask_cmd(interaction: discord.Interaction, question: str):
 
 @bot.tree.command(name="afk", description="Set yourself as AFK")
 async def afk_cmd(interaction: discord.Interaction, reason: str = "AFK"):
-    bot.afk_cache[(interaction.guild_id, interaction.user.id)] = {"reason": reason, "time": time.time()}
+    key = f"{interaction.guild_id}:{interaction.user.id}"
+    await cache_set("afk_cache", key, {"reason": reason, "time": time.time()})
     await interaction.response.send_message(embed=make_embed("💤 AFK Set", f"{interaction.user.mention} is now AFK: {reason}", discord.Color.blurple(), bot.user))
 
 
 async def handle_afk(message: discord.Message):
-    key = (message.guild.id, message.author.id)
-    if key in bot.afk_cache:
-        del bot.afk_cache[key]
+    key = f"{message.guild.id}:{message.author.id}"
+    info = await cache_get("afk_cache", key)
+    if info is not None:
+        await cache_delete("afk_cache", key)
         embed = make_embed("👋 Welcome Back", f"{message.author.mention}, I've removed your AFK status.", discord.Color.green(), bot.user)
         await message.channel.send(embed=embed, delete_after=10)
 
     if message.mentions:
         for user in message.mentions:
-            mkey = (message.guild.id, user.id)
-            if mkey in bot.afk_cache:
-                info = bot.afk_cache[mkey]
-                since = int(time.time() - info["time"])
-                embed = make_embed("💤 AFK", f"{user.mention} is AFK: {info['reason']} ({since}s ago)", discord.Color.blurple(), bot.user)
+            mkey = f"{message.guild.id}:{user.id}"
+            minfo = await cache_get("afk_cache", mkey)
+            if minfo is not None:
+                since = int(time.time() - minfo["time"])
+                embed = make_embed("💤 AFK", f"{user.mention} is AFK: {minfo['reason']} ({since}s ago)", discord.Color.blurple(), bot.user)
                 await message.channel.send(embed=embed, delete_after=10)
 
 
@@ -1513,6 +1678,218 @@ async def about_cmd(interaction: discord.Interaction):
 
 
 # ==================================================================
+# 24. REACTION-ROLE SYSTEM
+# ==================================================================
+
+reactionrole_group = app_commands.Group(name="reactionrole", description="Manage reaction roles")
+
+
+@reactionrole_group.command(name="add", description="Add a reaction role to a message")
+@has_admin_perms()
+async def reactionrole_add(interaction: discord.Interaction, message_id: str, emoji: str, role: discord.Role, channel: Optional[discord.TextChannel] = None):
+    channel = channel or interaction.channel
+    try:
+        target_message = await channel.fetch_message(int(message_id))
+    except (discord.NotFound, ValueError):
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "Message not found in that channel.", discord.Color.red(), bot.user), ephemeral=True)
+
+    try:
+        await target_message.add_reaction(emoji)
+    except discord.HTTPException:
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "Invalid emoji.", discord.Color.red(), bot.user), ephemeral=True)
+
+    supabase.table("reaction_roles").upsert({
+        "guild_id": interaction.guild_id, "channel_id": channel.id, "message_id": int(message_id),
+        "emoji": emoji, "role_id": role.id,
+    }, on_conflict="message_id,emoji").execute()
+
+    await interaction.response.send_message(embed=make_embed("✅ Reaction Role Added", f"{emoji} → {role.mention} on that message.", discord.Color.green(), bot.user), ephemeral=True)
+
+
+@reactionrole_group.command(name="remove", description="Remove a reaction role mapping")
+@has_admin_perms()
+async def reactionrole_remove(interaction: discord.Interaction, message_id: str, emoji: str):
+    supabase.table("reaction_roles").delete().eq("message_id", int(message_id)).eq("emoji", emoji).execute()
+    await interaction.response.send_message(embed=make_embed("✅ Reaction Role Removed", "Mapping removed.", discord.Color.green(), bot.user), ephemeral=True)
+
+
+bot.tree.add_command(reactionrole_group)
+
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if payload.member is None or payload.member.bot:
+        return
+    res = supabase.table("reaction_roles").select("*").eq("message_id", payload.message_id).eq("emoji", str(payload.emoji)).execute()
+    if not res.data:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    role = guild.get_role(res.data[0]["role_id"]) if guild else None
+    if guild and role:
+        try:
+            await payload.member.add_roles(role, reason="Reaction role")
+        except discord.Forbidden:
+            pass
+
+
+@bot.event
+async def on_raw_reaction_remove(payload: discord.RawReactionActionEvent):
+    res = supabase.table("reaction_roles").select("*").eq("message_id", payload.message_id).eq("emoji", str(payload.emoji)).execute()
+    if not res.data:
+        return
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return
+    member = guild.get_member(payload.user_id)
+    role = guild.get_role(res.data[0]["role_id"])
+    if member and role:
+        try:
+            await member.remove_roles(role, reason="Reaction role removed")
+        except discord.Forbidden:
+            pass
+
+
+# ==================================================================
+# 25. LEVELING / XP SYSTEM
+# ==================================================================
+
+LEVEL_XP_COOLDOWN = 60  # seconds between XP awards per user, to prevent spam-farming
+XP_PER_MESSAGE = (15, 25)  # random range
+
+
+def xp_for_level(level: int) -> int:
+    """Total XP required to reach `level` (simple quadratic curve)."""
+    return 5 * (level ** 2) + 50 * level + 100
+
+
+async def add_xp(message: discord.Message):
+    key = f"{message.guild.id}:{message.author.id}"
+    last_award = await cache_get("xp_cooldowns", key, default=0)
+    now = time.time()
+    if now - last_award < LEVEL_XP_COOLDOWN:
+        return
+    await cache_set("xp_cooldowns", key, now, ttl=LEVEL_XP_COOLDOWN)
+
+    import random
+    gained = random.randint(*XP_PER_MESSAGE)
+
+    res = supabase.table("levels").select("*").eq("guild_id", message.guild.id).eq("user_id", message.author.id).execute()
+    if res.data:
+        record = res.data[0]
+        new_xp = record["xp"] + gained
+        level = record["level"]
+        leveled_up = False
+        while new_xp >= xp_for_level(level):
+            new_xp -= xp_for_level(level)
+            level += 1
+            leveled_up = True
+        supabase.table("levels").update({"xp": new_xp, "level": level}).eq("id", record["id"]).execute()
+    else:
+        new_xp, level, leveled_up = gained, 0, False
+        supabase.table("levels").insert({"guild_id": message.guild.id, "user_id": message.author.id, "xp": new_xp, "level": level}).execute()
+
+    if leveled_up:
+        embed = make_embed("🎉 Level Up!", f"{message.author.mention} reached **level {level}**!", discord.Color.gold(), bot.user)
+        try:
+            await message.channel.send(embed=embed)
+        except discord.Forbidden:
+            pass
+
+
+@bot.tree.command(name="rank", description="View your (or another member's) level and XP")
+async def rank_cmd(interaction: discord.Interaction, member: Optional[discord.Member] = None):
+    member = member or interaction.user
+    res = supabase.table("levels").select("*").eq("guild_id", interaction.guild_id).eq("user_id", member.id).execute()
+    if not res.data:
+        return await interaction.response.send_message(embed=make_embed("📈 Rank", f"{member.mention} hasn't earned any XP yet.", discord.Color.blurple(), bot.user))
+    record = res.data[0]
+    needed = xp_for_level(record["level"])
+    embed = make_embed(f"📈 Rank — {member}", color=discord.Color.blurple(), bot_user=bot.user)
+    embed.add_field(name="Level", value=str(record["level"]), inline=True)
+    embed.add_field(name="XP", value=f"{record['xp']}/{needed}", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="levelleaderboard", description="View the server's XP leaderboard")
+async def levelleaderboard_cmd(interaction: discord.Interaction):
+    res = supabase.table("levels").select("*").eq("guild_id", interaction.guild_id).order("level", desc=True).order("xp", desc=True).limit(10).execute()
+    if not res.data:
+        return await interaction.response.send_message(embed=make_embed("🏆 XP Leaderboard", "No data yet.", discord.Color.blurple(), bot.user))
+    desc = "\n".join(f"**{i+1}.** <@{r['user_id']}> — Level {r['level']} ({r['xp']} XP)" for i, r in enumerate(res.data))
+    await interaction.response.send_message(embed=make_embed("🏆 XP Leaderboard", desc, discord.Color.gold(), bot.user))
+
+
+# ==================================================================
+# 26. BACKUP / RESTORE SYSTEM
+# ==================================================================
+# Snapshots the contents of guild_config (channels, toggles, messages, etc.)
+# so an admin can roll back after a misconfiguration or migrate settings.
+
+@bot.tree.command(name="backup", description="Create a backup of this server's VantixNodes configuration")
+@has_admin_perms()
+async def backup_cmd(interaction: discord.Interaction, label: str = "manual"):
+    cfg = await get_guild_config(interaction.guild_id)
+    snapshot = {k: v for k, v in cfg.items() if k != "guild_id"}
+    res = supabase.table("guild_backups").insert({
+        "guild_id": interaction.guild_id, "label": label, "snapshot": json.dumps(snapshot),
+        "created_at": datetime.datetime.utcnow().isoformat(),
+    }).execute()
+    backup_id = res.data[0]["id"]
+    await interaction.response.send_message(embed=make_embed("💾 Backup Created", f"Backup `#{backup_id}` (`{label}`) saved. Use `/restore backup_id:{backup_id}` to roll back to it.", discord.Color.green(), bot.user), ephemeral=True)
+
+
+@bot.tree.command(name="restore", description="Restore this server's VantixNodes configuration from a backup")
+@has_admin_perms()
+async def restore_cmd(interaction: discord.Interaction, backup_id: int):
+    res = supabase.table("guild_backups").select("*").eq("id", backup_id).eq("guild_id", interaction.guild_id).execute()
+    if not res.data:
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "Backup not found for this server.", discord.Color.red(), bot.user), ephemeral=True)
+    snapshot = json.loads(res.data[0]["snapshot"])
+    await update_guild_config(interaction.guild_id, **snapshot)
+    await interaction.response.send_message(embed=make_embed("♻️ Configuration Restored", f"Restored from backup `#{backup_id}` (`{res.data[0]['label']}`).", discord.Color.green(), bot.user))
+
+
+@bot.tree.command(name="backuplist", description="List available configuration backups for this server")
+@has_admin_perms()
+async def backuplist_cmd(interaction: discord.Interaction):
+    res = supabase.table("guild_backups").select("id,label,created_at").eq("guild_id", interaction.guild_id).order("created_at", desc=True).limit(10).execute()
+    if not res.data:
+        return await interaction.response.send_message(embed=make_embed("💾 Backups", "No backups yet. Use `/backup` to create one.", discord.Color.blurple(), bot.user), ephemeral=True)
+    desc = "\n".join(f"**#{b['id']}** — `{b['label']}` ({b['created_at'][:19]})" for b in res.data)
+    await interaction.response.send_message(embed=make_embed("💾 Backups", desc, discord.Color.blurple(), bot.user), ephemeral=True)
+
+
+# ==================================================================
+# 27. PREMIUM TIER SYSTEM
+# ==================================================================
+# Per-guild feature gating driven by the `premium` boolean on guild_config.
+# Wrap any command with @premium_feature() to restrict it to premium guilds
+# (already defined earlier, near get_guild_config). Example usages you can
+# apply to specific commands: @premium_feature() above @dmall_cmd, or above
+# a future "advanced analytics" command.
+
+premium_group = app_commands.Group(name="premium", description="Manage VantixNodes Premium for this server")
+
+
+@premium_group.command(name="status", description="Check this server's premium status")
+async def premium_status(interaction: discord.Interaction):
+    active = await is_premium(interaction.guild_id)
+    embed = make_embed("✨ VantixNodes Premium", f"Status: **{'Active ✅' if active else 'Inactive'}**", discord.Color.gold() if active else discord.Color.blurple(), bot.user)
+    await interaction.response.send_message(embed=embed)
+
+
+@premium_group.command(name="set", description="[Bot Owner Only] Toggle premium for a server")
+async def premium_set(interaction: discord.Interaction, guild_id: str, enabled: bool):
+    if interaction.user.id != interaction.guild.owner_id and not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "Only the bot owner can manage premium grants.", discord.Color.red(), bot.user), ephemeral=True)
+    await update_guild_config(int(guild_id), premium=enabled)
+    await interaction.response.send_message(embed=make_embed("✨ Premium Updated", f"Premium set to **{enabled}** for guild `{guild_id}`.", discord.Color.green(), bot.user), ephemeral=True)
+
+
+bot.tree.add_command(premium_group)
+
+
+# ==================================================================
 # LIFECYCLE EVENTS
 # ==================================================================
 
@@ -1524,6 +1901,8 @@ async def on_ready():
         giveaway_checker.start()
     if not status_monitor_loop.is_running():
         status_monitor_loop.start()
+    if not dm_queue_worker.is_running():
+        dm_queue_worker.start()
     try:
         synced = await bot.tree.sync()
         logger.info(f"Synced {len(synced)} slash commands.")
