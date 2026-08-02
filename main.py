@@ -1526,11 +1526,12 @@ async def botstats_cmd(interaction: discord.Interaction):
 
 @bot.tree.command(name="statusmonitor", description="Configure the live status monitor channel")
 @has_admin_perms()
-async def statusmonitor_cmd(interaction: discord.Interaction, channel: discord.abc.GuildChannel, address: str, port: Optional[int] = None):
+async def statusmonitor_cmd(interaction: discord.Interaction, channel: discord.TextChannel, address: str, port: Optional[int] = None):
     """`port` is optional — omit it to monitor plain host reachability (HTTP HEAD /
-    socket probe on common ports) instead of a specific TCP port."""
+    socket probe on common ports) instead of a specific TCP port.
+    Posts one status message and edits that same message every minute (no channel rename)."""
     supabase.table("status_monitor_config").upsert({
-        "guild_id": interaction.guild_id, "channel_id": channel.id, "address": address, "port": port
+        "guild_id": interaction.guild_id, "channel_id": channel.id, "address": address, "port": port, "message_id": None
     }, on_conflict="guild_id,channel_id").execute()
     target_desc = f"`{address}:{port}`" if port else f"`{address}` (host reachability only)"
     await interaction.response.send_message(embed=make_embed("📡 Status Monitor", f"Monitoring {target_desc} → {channel.mention}", discord.Color.green(), bot.user))
@@ -1579,10 +1580,31 @@ async def status_monitor_loop():
             online = await check_host(cfg["address"], port)
             status_icon = "🟢" if online else "🔴"
             port_label = f" | Port: {port}" if port else ""
-            new_name = f"{status_icon} Node: {'Online' if online else 'Offline'}{port_label}"
-            if channel.name != new_name:
+            target_desc = f"{cfg['address']}{(':' + str(port)) if port else ''}"
+            embed = make_embed(
+                "📡 Status Monitor",
+                f"{status_icon} **{'Online' if online else 'Offline'}**\nTarget: `{target_desc}`{port_label}\nLast checked: <t:{int(time.time())}:R>",
+                discord.Color.green() if online else discord.Color.red(),
+                bot.user,
+            )
+
+            message_id = cfg.get("message_id")
+            message = None
+            if message_id:
                 try:
-                    await channel.edit(name=new_name)
+                    message = await channel.fetch_message(int(message_id))
+                except (discord.NotFound, discord.HTTPException):
+                    message = None
+
+            if message:
+                try:
+                    await message.edit(embed=embed)
+                except discord.HTTPException:
+                    pass
+            else:
+                try:
+                    new_message = await channel.send(embed=embed)
+                    supabase.table("status_monitor_config").update({"message_id": new_message.id}).eq("id", cfg["id"]).execute()
                 except discord.HTTPException:
                     pass
     except Exception as e:
