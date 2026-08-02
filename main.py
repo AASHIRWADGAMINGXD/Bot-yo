@@ -31,7 +31,6 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from supabase import create_client, Client
 import aiohttp
-import redis.asyncio as redis_lib
 
 try:
     import redis.asyncio as aioredis
@@ -339,7 +338,7 @@ async def antinuke_check(guild: discord.Guild, actor: discord.abc.User, action: 
     try:
         supabase.table("antinuke_logs").insert({
             "guild_id": guild.id, "actor_id": actor.id, "action": action,
-            "punishment": punishment, "created_at": datetime.datetime.utcnow().isoformat()
+            "punishment": punishment, "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }).execute()
     except Exception as e:
         logger.error(f"antinuke log insert error: {e}")
@@ -426,7 +425,10 @@ async def antinuke_threshold(interaction: discord.Interaction, actions: int, win
 @antinuke_group.command(name="whitelist", description="Whitelist a trusted user/bot")
 @has_admin_perms()
 async def antinuke_whitelist(interaction: discord.Interaction, user: discord.User):
-    supabase.table("antinuke_whitelist").insert({"guild_id": interaction.guild_id, "user_id": user.id}).execute()
+    existing = supabase.table("antinuke_whitelist").select("id").eq("guild_id", interaction.guild_id).eq("user_id", user.id).execute()
+    if existing.data:
+        return await interaction.response.send_message(embed=make_embed("🛡️ Anti-Nuke", f"{user.mention} is already whitelisted.", discord.Color.orange(), bot.user), ephemeral=True)
+    supabase.table("antinuke_whitelist").upsert({"guild_id": interaction.guild_id, "user_id": user.id}, on_conflict="guild_id,user_id").execute()
     await interaction.response.send_message(embed=make_embed("🛡️ Anti-Nuke", f"{user.mention} whitelisted.", discord.Color.green(), bot.user))
 
 
@@ -654,7 +656,7 @@ async def untimeout_cmd(interaction: discord.Interaction, member: discord.Member
 async def add_warn(guild: discord.Guild, member: discord.abc.User, moderator: discord.abc.User, reason: str):
     supabase.table("warns").insert({
         "guild_id": guild.id, "user_id": member.id, "moderator_id": moderator.id,
-        "reason": reason, "created_at": datetime.datetime.utcnow().isoformat()
+        "reason": reason, "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }).execute()
 
     res = supabase.table("warns").select("id").eq("guild_id", guild.id).eq("user_id", member.id).execute()
@@ -943,7 +945,7 @@ async def create_ticket(interaction: discord.Interaction, category_name: str):
 
     supabase.table("tickets").insert({
         "guild_id": guild.id, "channel_id": channel.id, "user_id": interaction.user.id,
-        "category": category_name, "status": "open", "created_at": datetime.datetime.utcnow().isoformat()
+        "category": category_name, "status": "open", "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
     }).execute()
 
     embed = make_embed(f"🎫 {category_name} Ticket", f"Welcome {interaction.user.mention}! Support will be with you shortly.\nClick **Close** when your issue is resolved.", discord.Color.blurple(), bot.user)
@@ -1170,7 +1172,7 @@ async def dmall_cmd(interaction: discord.Interaction, title: str, message: str):
         "guild_id": interaction.guild_id, "requested_by": interaction.user.id,
         "title": title, "message": message, "targets": json.dumps(member_ids),
         "sent": 0, "failed": 0, "status": "queued",
-        "created_at": datetime.datetime.utcnow().isoformat(),
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }).execute()
     job_id = job.data[0]["id"]
 
@@ -1274,7 +1276,7 @@ async def handle_invite_join(member: discord.Member):
         supabase.table("invites").insert({
             "guild_id": guild.id, "inviter_id": used_invite.inviter.id if used_invite.inviter else None,
             "invited_id": member.id, "code": used_invite.code, "status": "active",
-            "joined_at": datetime.datetime.utcnow().isoformat()
+            "joined_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
         }).execute()
 
 
@@ -1348,7 +1350,7 @@ async def gcreate_cmd(interaction: discord.Interaction, prize: str, duration: st
     if seconds is None:
         return await interaction.response.send_message(embed=make_embed("❌ Error", "Invalid duration. Use e.g. `1h`, `1d`.", discord.Color.red(), bot.user), ephemeral=True)
     channel = channel or interaction.channel
-    end_time = datetime.datetime.utcnow() + datetime.timedelta(seconds=seconds)
+    end_time = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
 
     embed = make_embed(f"🎉 Giveaway: {prize}", f"Winners: **{winners}**\nEnds: <t:{int(end_time.timestamp())}:R>\nClick the button below to enter!", discord.Color.gold(), bot.user)
     msg = await channel.send(embed=embed)
@@ -1423,7 +1425,7 @@ async def glist_cmd(interaction: discord.Interaction):
 @tasks.loop(seconds=30)
 async def giveaway_checker():
     try:
-        now = datetime.datetime.utcnow().isoformat()
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         res = supabase.table("giveaways").select("*").eq("status", "active").lte("end_time", now).execute()
         for giveaway in res.data:
             await end_giveaway(giveaway)
@@ -1832,7 +1834,7 @@ async def backup_cmd(interaction: discord.Interaction, label: str = "manual"):
     snapshot = {k: v for k, v in cfg.items() if k != "guild_id"}
     res = supabase.table("guild_backups").insert({
         "guild_id": interaction.guild_id, "label": label, "snapshot": json.dumps(snapshot),
-        "created_at": datetime.datetime.utcnow().isoformat(),
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }).execute()
     backup_id = res.data[0]["id"]
     await interaction.response.send_message(embed=make_embed("💾 Backup Created", f"Backup `#{backup_id}` (`{label}`) saved. Use `/restore backup_id:{backup_id}` to roll back to it.", discord.Color.green(), bot.user), ephemeral=True)
