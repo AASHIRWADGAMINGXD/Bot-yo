@@ -31,6 +31,8 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 from supabase import create_client, Client
 import aiohttp
+from threading import Thread
+from flask import Flask
 
 try:
     import redis.asyncio as aioredis
@@ -1943,8 +1945,31 @@ async def on_guild_join(guild):
 
 
 # ==================================================================
+# FLASK KEEP-ALIVE SERVER (for Render/Replit-style hosting)
+# ==================================================================
+
+keep_alive_app = Flask(__name__)
+
+
+@keep_alive_app.route("/")
+def keep_alive_home():
+    return f"{BOT_NAME} is alive."
+
+
+def run_keep_alive():
+    keep_alive_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
+
+def keep_alive():
+    t = Thread(target=run_keep_alive)
+    t.daemon = True
+    t.start()
+
+
+# ==================================================================
 # ENTRYPOINT
 # ==================================================================
 
 if __name__ == "__main__":
+    keep_alive()
     bot.run(DISCORD_TOKEN, log_handler=None)
