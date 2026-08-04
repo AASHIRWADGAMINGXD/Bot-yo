@@ -484,12 +484,16 @@ async def on_message(message: discord.Message):
     await handle_afk(message)
     await handle_custom_command(message)
     await handle_badwords(message)
+    await handle_antispam(message)
     await add_xp(message)
 
     await bot.process_commands(message)
 
 
 async def handle_badwords(message: discord.Message):
+    cfg = await get_guild_config(message.guild.id)
+    if not cfg.get("automode_enabled", True):
+        return
     if message.author.guild_permissions.manage_messages:
         return
     try:
@@ -1913,6 +1917,211 @@ async def premium_set(interaction: discord.Interaction, guild_id: str, enabled: 
 
 
 bot.tree.add_command(premium_group)
+
+
+# ==================================================================
+# 28. REVIEW / FEEDBACK SYSTEM
+# ==================================================================
+
+@bot.tree.command(name="review", description="Leave a star rating and review for the server/bot")
+async def review_cmd(interaction: discord.Interaction, rate: app_commands.Range[int, 1, 5], description: str):
+    cfg = await get_guild_config(interaction.guild_id)
+    stars = "⭐" * rate + "☆" * (5 - rate)
+
+    embed = discord.Embed(title="📝 New Review", description=description, color=discord.Color.gold())
+    embed.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
+    embed.add_field(name="Rating", value=stars, inline=False)
+    embed_footer(embed, bot.user)
+
+    supabase.table("reviews").insert({
+        "guild_id": interaction.guild_id, "user_id": interaction.user.id,
+        "rating": rate, "description": description,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
+    }).execute()
+
+    review_channel_id = cfg.get("review_channel")
+    if review_channel_id:
+        target = interaction.guild.get_channel(int(review_channel_id))
+        if target:
+            await target.send(embed=embed)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="reviewsetup", description="Set the channel where reviews are posted")
+@has_admin_perms()
+async def reviewsetup_cmd(interaction: discord.Interaction, channel: discord.TextChannel):
+    await update_guild_config(interaction.guild_id, review_channel=channel.id)
+    await interaction.response.send_message(embed=make_embed("📝 Review Setup", f"Reviews will now also be posted in {channel.mention}.", discord.Color.green(), bot.user), ephemeral=True)
+
+
+# ==================================================================
+# 29. ROLE ADD / REMOVE COMMANDS
+# ==================================================================
+
+@bot.tree.command(name="roleadd", description="Give a role to a member")
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.checks.bot_has_permissions(manage_roles=True)
+async def roleadd_cmd(interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+    if role >= interaction.guild.me.top_role:
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "I can't assign a role higher than or equal to my own top role.", discord.Color.red(), bot.user), ephemeral=True)
+    if role in member.roles:
+        return await interaction.response.send_message(embed=make_embed("⚠️ Role Add", f"{member.mention} already has {role.mention}.", discord.Color.orange(), bot.user), ephemeral=True)
+    await member.add_roles(role, reason=f"Added by {interaction.user}")
+    await interaction.response.send_message(embed=make_embed("✅ Role Added", f"Gave {role.mention} to {member.mention}.", discord.Color.green(), bot.user))
+
+
+@bot.tree.command(name="roleremove", description="Remove a role from a member")
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.checks.bot_has_permissions(manage_roles=True)
+async def roleremove_cmd(interaction: discord.Interaction, member: discord.Member, role: discord.Role):
+    if role >= interaction.guild.me.top_role:
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "I can't remove a role higher than or equal to my own top role.", discord.Color.red(), bot.user), ephemeral=True)
+    if role not in member.roles:
+        return await interaction.response.send_message(embed=make_embed("⚠️ Role Remove", f"{member.mention} doesn't have {role.mention}.", discord.Color.orange(), bot.user), ephemeral=True)
+    await member.remove_roles(role, reason=f"Removed by {interaction.user}")
+    await interaction.response.send_message(embed=make_embed("✅ Role Removed", f"Removed {role.mention} from {member.mention}.", discord.Color.green(), bot.user))
+
+
+# ==================================================================
+# 30. AUTOMODE (master auto-moderation toggle)
+# ==================================================================
+
+automode_group = app_commands.Group(name="automode", description="Toggle automatic moderation (badwords + anti-spam)")
+
+
+@automode_group.command(name="enable", description="Enable automod (badwords filter + anti-spam)")
+@has_admin_perms()
+async def automode_enable(interaction: discord.Interaction):
+    await update_guild_config(interaction.guild_id, automode_enabled=True)
+    await interaction.response.send_message(embed=make_embed("🤖 Automode", "Automod is now **enabled**.", discord.Color.green(), bot.user))
+
+
+@automode_group.command(name="disable", description="Disable automod (badwords filter + anti-spam)")
+@has_admin_perms()
+async def automode_disable(interaction: discord.Interaction):
+    await update_guild_config(interaction.guild_id, automode_enabled=False)
+    await interaction.response.send_message(embed=make_embed("🤖 Automode", "Automod is now **disabled**.", discord.Color.orange(), bot.user))
+
+
+bot.tree.add_command(automode_group)
+
+# ==================================================================
+# 31. PREFIX CONFIG
+# ==================================================================
+
+@bot.tree.command(name="setprefix", description="Change the custom-command prefix for this server")
+@has_admin_perms()
+async def setprefix_cmd(interaction: discord.Interaction, prefix: str):
+    if len(prefix) > 5:
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "Prefix must be 5 characters or fewer.", discord.Color.red(), bot.user), ephemeral=True)
+    await update_guild_config(interaction.guild_id, prefix=prefix)
+    await interaction.response.send_message(embed=make_embed("✅ Prefix Updated", f"New prefix: `{prefix}`", discord.Color.green(), bot.user))
+
+
+# ==================================================================
+# 32. BOT STATUS / PRESENCE CONTROL (Bot Owner Only)
+# ==================================================================
+
+@bot.tree.command(name="setstatus", description="[Bot Owner Only] Change the bot's presence status")
+async def setstatus_cmd(interaction: discord.Interaction, status: Literal["online", "idle", "dnd", "invisible"], activity_text: Optional[str] = None):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "Only the bot owner can change the bot's status.", discord.Color.red(), bot.user), ephemeral=True)
+
+    status_map = {
+        "online": discord.Status.online,
+        "idle": discord.Status.idle,
+        "dnd": discord.Status.dnd,
+        "invisible": discord.Status.invisible,
+    }
+    activity = discord.Activity(type=discord.ActivityType.watching, name=activity_text) if activity_text else None
+    await bot.change_presence(status=status_map[status], activity=activity)
+    await interaction.response.send_message(embed=make_embed("✅ Status Updated", f"Bot status set to **{status}**" + (f" — {activity_text}" if activity_text else ""), discord.Color.green(), bot.user), ephemeral=True)
+
+
+# ==================================================================
+# 33. ANTI-SPAM SYSTEM
+# ==================================================================
+
+bot.antispam_tracker: dict[tuple, list] = {}  # (guild_id, user_id) -> list of message timestamps
+
+antispam_group = app_commands.Group(name="antispam", description="Configure anti-spam protection")
+
+
+@antispam_group.command(name="enable", description="[Server Owner Only] Enable anti-spam protection")
+async def antispam_enable(interaction: discord.Interaction):
+    if interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "Only the server owner can configure anti-spam.", discord.Color.red(), bot.user), ephemeral=True)
+    await update_guild_config(interaction.guild_id, antispam_enabled=True)
+    await interaction.response.send_message(embed=make_embed("🚫 Anti-Spam", "Anti-spam protection **enabled**.", discord.Color.green(), bot.user))
+
+
+@antispam_group.command(name="disable", description="[Server Owner Only] Disable anti-spam protection")
+async def antispam_disable(interaction: discord.Interaction):
+    if interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "Only the server owner can configure anti-spam.", discord.Color.red(), bot.user), ephemeral=True)
+    await update_guild_config(interaction.guild_id, antispam_enabled=False)
+    await interaction.response.send_message(embed=make_embed("🚫 Anti-Spam", "Anti-spam protection **disabled**.", discord.Color.orange(), bot.user))
+
+
+@antispam_group.command(name="config", description="[Server Owner Only] Configure anti-spam threshold & punishment")
+async def antispam_config(interaction: discord.Interaction, messages: int, seconds: int, punishment: Literal["warn", "timeout", "kick", "ban"]):
+    if interaction.user.id != interaction.guild.owner_id:
+        return await interaction.response.send_message(embed=make_embed("❌ Error", "Only the server owner can configure anti-spam.", discord.Color.red(), bot.user), ephemeral=True)
+    await update_guild_config(interaction.guild_id, antispam_threshold=messages, antispam_window=seconds, antispam_punishment=punishment)
+    await interaction.response.send_message(embed=make_embed("🚫 Anti-Spam Configured", f"Trigger: **{messages}** messages / **{seconds}s**\nPunishment: **{punishment}**", discord.Color.green(), bot.user))
+
+
+bot.tree.add_command(antispam_group)
+
+
+async def handle_antispam(message: discord.Message):
+    cfg = await get_guild_config(message.guild.id)
+    if not cfg.get("antispam_enabled"):
+        return
+    if message.author.guild_permissions.manage_messages:
+        return
+
+    threshold = cfg.get("antispam_threshold", 5)
+    window = cfg.get("antispam_window", 5)
+    punishment = cfg.get("antispam_punishment", "timeout")
+
+    key = (message.guild.id, message.author.id)
+    now = time.time()
+    events = bot.antispam_tracker.setdefault(key, [])
+    events.append(now)
+    events[:] = [t for t in events if now - t <= window]
+
+    if len(events) < threshold:
+        return
+    events.clear()
+
+    try:
+        await message.channel.purge(limit=threshold, check=lambda m: m.author.id == message.author.id)
+    except discord.Forbidden:
+        pass
+
+    action_taken = "warned"
+    try:
+        if punishment == "timeout":
+            await message.author.timeout(discord.utils.utcnow() + datetime.timedelta(minutes=10), reason="Anti-Spam: message flood")
+            action_taken = "timed out for 10 minutes"
+        elif punishment == "kick":
+            await message.author.kick(reason="Anti-Spam: message flood")
+            action_taken = "kicked"
+        elif punishment == "ban":
+            await message.author.ban(reason="Anti-Spam: message flood")
+            action_taken = "banned"
+        else:
+            await add_warn(message.guild, message.author, bot.user, "Automatic warn: spamming messages")
+            action_taken = "warned"
+    except discord.Forbidden:
+        action_taken = "flagged (missing permissions to punish)"
+
+    embed = make_embed("🚫 Anti-Spam Triggered", color=discord.Color.red(), bot_user=bot.user)
+    embed.add_field(name="User", value=f"{message.author} (`{message.author.id}`)", inline=True)
+    embed.add_field(name="Channel", value=message.channel.mention, inline=True)
+    embed.add_field(name="Action Taken", value=action_taken, inline=False)
+    await log_to_channel(message.guild, cfg.get("modlog_channel"), embed)
 
 
 # ==================================================================
