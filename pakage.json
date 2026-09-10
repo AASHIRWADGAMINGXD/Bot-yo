@@ -5,6 +5,7 @@
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
+    "build": "yarn install",
     "start": "node index.js"
   },
   "dependencies": {
