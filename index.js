@@ -24,6 +24,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
+const express = require('express');
 
 const {
   Client, GatewayIntentBits, Partials, Collection, REST, Routes,
@@ -2161,6 +2162,7 @@ async function handleSelect(interaction) {
   }
 }
 
+
 // ---------------------------------------------------------------------------
 // MODAL HANDLER (reserved for future expansion — no modals require submission
 // handling beyond what buttons/selects already cover in this build)
@@ -2174,5 +2176,11 @@ async function handleModal(interaction) {
 // ---------------------------------------------------------------------------
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', (err) => console.error('Unhandled Rejection:', err));
-
+// ---------------------------------------------------------------------------
+// KEEP-ALIVE WEB SERVER
+// ---------------------------------------------------------------------------
+const app = express();
+app.get('/', (req, res) => res.send('Bot is alive.'));
+app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime(), guilds: client.guilds.cache.size }));
+app.listen(process.env.PORT || 3000, () => console.log(`Web server listening on port ${process.env.PORT || 3000}`));
 client.login(process.env.DISCORD_TOKEN);
