@@ -1,0 +1,2178 @@
+/**
+ * ALL-IN-ONE DISCORD BOT — single file (index.js)
+ * Discord.js v14
+ *
+ * Persistence: flat JSON file (./data/db.json), loaded into memory and
+ * written to disk (debounced) on every mutation. Simple, dependency-free,
+ * survives restarts.
+ *
+ * NOTE ON SCOPE: This file implements a real, working core of every system
+ * requested (super admin / extra owner / protected users, moderation,
+ * anti-spam, basic anti-nuke, bad words, tickets, welcome/goodbye, autorole,
+ * sticky roles, AFK, invites, reaction roles, starboard, giveaways, polls,
+ * reminders, custom commands, info commands, logging, help pagination,
+ * botconfig UI). Anti-nuke "restoring deleted channels/roles" is implemented
+ * as best-effort recreation (Discord does not let a bot literally undelete
+ * an object — it can only recreate one with the same name/permissions from
+ * cached data). Status-monitor / weather / QR code are implemented with
+ * real network calls where a free, keyless API exists; where a paid key is
+ * required, the command tells the operator which env var to set instead of
+ * pretending to work.
+ */
+
+require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+const https = require('https');
+
+const {
+  Client, GatewayIntentBits, Partials, Collection, REST, Routes,
+  SlashCommandBuilder, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder,
+  ButtonBuilder, ButtonStyle, StringSelectMenuBuilder, ModalBuilder,
+  TextInputBuilder, TextInputStyle, ChannelType, AttachmentBuilder,
+  PermissionsBitField,
+} = require('discord.js');
+
+// ---------------------------------------------------------------------------
+// DATABASE (JSON file, in-memory cache + debounced save)
+// ---------------------------------------------------------------------------
+const DATA_DIR = path.join(__dirname, 'data');
+const DB_FILE = path.join(DATA_DIR, 'db.json');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const DEFAULT_DB = () => ({
+  guilds: {}, // per-guild config, keyed by guild id
+});
+
+function loadDB() {
+  if (!fs.existsSync(DB_FILE)) {
+    fs.writeFileSync(DB_FILE, JSON.stringify(DEFAULT_DB(), null, 2));
+  }
+  try {
+    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+  } catch (e) {
+    console.error('Failed to parse db.json, reinitializing.', e);
+    const fresh = DEFAULT_DB();
+    fs.writeFileSync(DB_FILE, JSON.stringify(fresh, null, 2));
+    return fresh;
+  }
+}
+
+const db = loadDB();
+let saveTimer = null;
+function saveDB() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    fs.writeFile(DB_FILE, JSON.stringify(db, null, 2), (err) => {
+      if (err) console.error('DB save error:', err);
+    });
+  }, 250);
+}
+
+function defaultGuildConfig() {
+  return {
+    superAdmins: [],
+    extraOwners: [],
+    protectedExtra: [],
+    antinuke: {
+      enabled: false,
+      whitelist: [],
+      thresholds: { channelDelete: 3, channelCreate: 5, roleDelete: 3, roleCreate: 5, ban: 3, kick: 3, webhook: 3 },
+      windowMs: 10000,
+      logChannel: null,
+      logs: [],
+    },
+    antispam: {
+      enabled: false,
+      logChannel: null,
+      msgLimit: 5,
+      msgWindowMs: 5000,
+      duplicateWindowMs: 15000,
+      mentionLimit: 5,
+      capsPercent: 70,
+      linkLimit: 2,
+      blockInvites: true,
+      repeatedCharLimit: 8,
+    },
+    badwords: [],
+    warnings: {}, // userId -> [{reason, mod, ts}]
+    tickets: {
+      categoryId: null,
+      supportRoles: [],
+      panels: {}, // panelId -> {channelId, messageId, title, description, types:[]}
+      types: {}, // typeName -> {label, emoji}
+      openTickets: {}, // channelId -> {userId, type, claimedBy, createdAt}
+      userTicketCount: {},
+      logChannel: null,
+      nextPanelId: 1,
+      closedCount: 0,
+    },
+    welcome: { enabled: false, channelId: null, message: 'Welcome {user} to {server}! You are member #{membercount}.', embed: true },
+    goodbye: { enabled: false, channelId: null, message: '{username} has left {server}. We now have {membercount} members.', embed: true },
+    autorole: { roleId: null },
+    stickyroles: { enabled: false, store: {} }, // userId -> [roleIds]
+    verification: { enabled: false, roleId: null, channelId: null, messageId: null },
+    serverstats: { channels: {} }, // key -> channelId
+    starboard: { enabled: false, channelId: null, threshold: 3, messages: {} }, // origMsgId -> starboardMsgId
+    reactionroles: [], // {messageId, channelId, emoji, roleId}
+    autopublish: { channels: [] },
+    logging: { channelId: null },
+    dmlogs: [],
+    invites: { cache: {}, joins: {}, leaders: {} }, // code->uses, userId->{code,inviter}, inviterId->count
+    customcommands: {}, // name -> response
+    giveaways: {}, // messageId -> {channelId, prize, winners, endsAt, entrants:[], ended}
+    statusmonitors: [], // {url, lastStatus}
+    reminders: [], // {userId, channelId, remindAt, text, id}
+    afk: {}, // userId -> {reason, since}
+  };
+}
+
+function getGuild(guildId) {
+  if (!db.guilds[guildId]) {
+    db.guilds[guildId] = defaultGuildConfig();
+    saveDB();
+  } else {
+    // backfill any missing keys from default (for upgrades)
+    const def = defaultGuildConfig();
+    for (const k of Object.keys(def)) {
+      if (db.guilds[guildId][k] === undefined) db.guilds[guildId][k] = def[k];
+    }
+  }
+  return db.guilds[guildId];
+}
+
+// ---------------------------------------------------------------------------
+// CLIENT
+// ---------------------------------------------------------------------------
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildModeration,
+    GatewayIntentBits.GuildInvites,
+    GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildPresences,
+    GatewayIntentBits.GuildWebhooks,
+  ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction, Partials.GuildMember, Partials.User],
+});
+
+client.cooldowns = new Collection();
+const startTime = Date.now();
+
+// ---------------------------------------------------------------------------
+// PERMISSION HELPERS
+// ---------------------------------------------------------------------------
+const LEVEL = { USER: 1, MOD: 2, ADMIN: 3, EXTRA_OWNER: 4, SUPER_ADMIN: 5, OWNER: 6 };
+
+function isProtected(guild, gconf, userId) {
+  if (userId === guild.ownerId) return true;
+  if (gconf.extraOwners.includes(userId)) return true;
+  if (gconf.superAdmins.includes(userId)) return true;
+  if (gconf.protectedExtra.includes(userId)) return true;
+  return false;
+}
+
+function getLevel(guild, gconf, member) {
+  if (!member) return LEVEL.USER;
+  if (member.id === guild.ownerId) return LEVEL.OWNER;
+  if (gconf.superAdmins.includes(member.id)) return LEVEL.SUPER_ADMIN;
+  if (gconf.extraOwners.includes(member.id)) return LEVEL.EXTRA_OWNER;
+  if (member.permissions?.has(PermissionFlagsBits.Administrator)) return LEVEL.ADMIN;
+  if (member.permissions?.has(PermissionFlagsBits.ModerateMembers) || member.permissions?.has(PermissionFlagsBits.KickMembers)) return LEVEL.MOD;
+  return LEVEL.USER;
+}
+
+function requireLevel(interaction, gconf, min) {
+  const lvl = getLevel(interaction.guild, gconf, interaction.member);
+  return lvl >= min;
+}
+
+// bot hierarchy check: can the bot act on target member?
+function botCanActOn(guild, targetMember) {
+  const me = guild.members.me;
+  if (!me) return false;
+  if (targetMember.id === guild.ownerId) return false;
+  return me.roles.highest.comparePositionTo(targetMember.roles.highest) > 0;
+}
+
+function actorOutranks(actorMember, targetMember, guild) {
+  if (actorMember.id === guild.ownerId) return true;
+  return actorMember.roles.highest.comparePositionTo(targetMember.roles.highest) > 0;
+}
+
+// ---------------------------------------------------------------------------
+// EMBED HELPERS
+// ---------------------------------------------------------------------------
+const COLORS = { success: 0x57F287, error: 0xED4245, warning: 0xFEE75C, info: 0x5865F2, neutral: 0x2B2D31 };
+
+function successEmbed(desc, title = 'Success') {
+  return new EmbedBuilder().setColor(COLORS.success).setTitle(`✅ ${title}`).setDescription(desc).setTimestamp();
+}
+function errorEmbed(desc, title = 'Error') {
+  return new EmbedBuilder().setColor(COLORS.error).setTitle(`❌ ${title}`).setDescription(desc).setTimestamp();
+}
+function warnEmbed(desc, title = 'Warning') {
+  return new EmbedBuilder().setColor(COLORS.warning).setTitle(`⚠️ ${title}`).setDescription(desc).setTimestamp();
+}
+function infoEmbed(desc, title = 'Info') {
+  return new EmbedBuilder().setColor(COLORS.info).setTitle(title).setDescription(desc).setTimestamp();
+}
+
+async function safeReply(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      return await interaction.editReply(payload);
+    }
+    return await interaction.reply(payload);
+  } catch (e) {
+    console.error('safeReply error:', e?.message);
+  }
+}
+
+async function logEvent(guild, gconf, embed) {
+  if (!gconf.logging.channelId) return;
+  try {
+    const ch = await guild.channels.fetch(gconf.logging.channelId).catch(() => null);
+    if (ch) await ch.send({ embeds: [embed] });
+  } catch (e) { /* ignore */ }
+}
+
+function replaceVars(str, { user, guild, memberCount }) {
+  return str
+    .replaceAll('{user}', user ? `<@${user.id}>` : '')
+    .replaceAll('{username}', user ? user.username : '')
+    .replaceAll('{server}', guild ? guild.name : '')
+    .replaceAll('{membercount}', String(memberCount ?? guild?.memberCount ?? ''));
+}
+
+// ---------------------------------------------------------------------------
+// SLASH COMMAND DEFINITIONS
+// ---------------------------------------------------------------------------
+const commands = [];
+function cmd(builder) { commands.push(builder); return builder; }
+
+cmd(new SlashCommandBuilder().setName('superadmin').setDescription('Manage bot super admins')
+  .addSubcommand(s => s.setName('add').setDescription('Add a super admin').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
+  .addSubcommand(s => s.setName('remove').setDescription('Remove a super admin').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
+  .addSubcommand(s => s.setName('list').setDescription('List super admins')));
+
+cmd(new SlashCommandBuilder().setName('extraowner').setDescription('Manage bot extra owners')
+  .addSubcommand(s => s.setName('add').setDescription('Add an extra owner').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
+  .addSubcommand(s => s.setName('remove').setDescription('Remove an extra owner').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
+  .addSubcommand(s => s.setName('list').setDescription('List extra owners')));
+
+cmd(new SlashCommandBuilder().setName('botconfig').setDescription('Open the interactive bot configuration panel'));
+
+cmd(new SlashCommandBuilder().setName('antinuke').setDescription('Anti-nuke protection system')
+  .addSubcommand(s => s.setName('enable').setDescription('Enable anti-nuke'))
+  .addSubcommand(s => s.setName('disable').setDescription('Disable anti-nuke'))
+  .addSubcommand(s => s.setName('config').setDescription('View/edit anti-nuke thresholds')
+    .addStringOption(o => o.setName('setting').setDescription('Threshold to change').addChoices(
+      { name: 'channelDelete', value: 'channelDelete' }, { name: 'channelCreate', value: 'channelCreate' },
+      { name: 'roleDelete', value: 'roleDelete' }, { name: 'roleCreate', value: 'roleCreate' },
+      { name: 'ban', value: 'ban' }, { name: 'kick', value: 'kick' }, { name: 'webhook', value: 'webhook' },
+      { name: 'windowMs', value: 'windowMs' }, { name: 'logChannel', value: 'logChannel' },
+    ))
+    .addStringOption(o => o.setName('value').setDescription('New value (number, or #channel mention for logChannel)')))
+  .addSubcommandGroup(g => g.setName('whitelist').setDescription('Manage anti-nuke whitelist')
+    .addSubcommand(s => s.setName('add').setDescription('Whitelist a user').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
+    .addSubcommand(s => s.setName('remove').setDescription('Remove from whitelist').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
+    .addSubcommand(s => s.setName('list').setDescription('List whitelist')))
+  .addSubcommand(s => s.setName('logs').setDescription('Show recent anti-nuke events')));
+
+cmd(new SlashCommandBuilder().setName('antispam').setDescription('Anti-spam / automod system')
+  .addSubcommand(s => s.setName('enable').setDescription('Enable anti-spam'))
+  .addSubcommand(s => s.setName('disable').setDescription('Disable anti-spam'))
+  .addSubcommand(s => s.setName('config').setDescription('Edit anti-spam thresholds')
+    .addStringOption(o => o.setName('setting').setDescription('Setting to change').addChoices(
+      { name: 'msgLimit', value: 'msgLimit' }, { name: 'msgWindowMs', value: 'msgWindowMs' },
+      { name: 'mentionLimit', value: 'mentionLimit' }, { name: 'capsPercent', value: 'capsPercent' },
+      { name: 'linkLimit', value: 'linkLimit' }, { name: 'blockInvites', value: 'blockInvites' },
+      { name: 'repeatedCharLimit', value: 'repeatedCharLimit' }, { name: 'logChannel', value: 'logChannel' },
+    ).setRequired(true))
+    .addStringOption(o => o.setName('value').setDescription('New value').setRequired(true))));
+
+cmd(new SlashCommandBuilder().setName('badwords').setDescription('Manage the bad word filter')
+  .addSubcommand(s => s.setName('add').setDescription('Add a word').addStringOption(o => o.setName('word').setDescription('Word').setRequired(true)))
+  .addSubcommand(s => s.setName('remove').setDescription('Remove a word').addStringOption(o => o.setName('word').setDescription('Word').setRequired(true)))
+  .addSubcommand(s => s.setName('list').setDescription('List filtered words (DM only)')));
+
+cmd(new SlashCommandBuilder().setName('ban').setDescription('Ban a member')
+  .addUserOption(o => o.setName('user').setDescription('User to ban').setRequired(true))
+  .addStringOption(o => o.setName('reason').setDescription('Reason')));
+cmd(new SlashCommandBuilder().setName('kick').setDescription('Kick a member')
+  .addUserOption(o => o.setName('user').setDescription('User to kick').setRequired(true))
+  .addStringOption(o => o.setName('reason').setDescription('Reason')));
+cmd(new SlashCommandBuilder().setName('timeout').setDescription('Timeout a member')
+  .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+  .addStringOption(o => o.setName('duration').setDescription('e.g. 10m, 1h, 1d').setRequired(true))
+  .addStringOption(o => o.setName('reason').setDescription('Reason')));
+cmd(new SlashCommandBuilder().setName('warn').setDescription('Warn a member')
+  .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+  .addStringOption(o => o.setName('reason').setDescription('Reason').setRequired(true)));
+cmd(new SlashCommandBuilder().setName('warnings').setDescription('View warnings for a member')
+  .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)));
+cmd(new SlashCommandBuilder().setName('clearwarns').setDescription('Clear warnings for a member')
+  .addUserOption(o => o.setName('user').setDescription('User').setRequired(true)));
+cmd(new SlashCommandBuilder().setName('purge').setDescription('Bulk delete messages')
+  .addIntegerOption(o => o.setName('amount').setDescription('1-100').setRequired(true).setMinValue(1).setMaxValue(100)));
+cmd(new SlashCommandBuilder().setName('lock').setDescription('Lock the current channel'));
+cmd(new SlashCommandBuilder().setName('unlock').setDescription('Unlock the current channel'));
+cmd(new SlashCommandBuilder().setName('slowmode').setDescription('Set slowmode for this channel')
+  .addIntegerOption(o => o.setName('seconds').setDescription('0-21600').setRequired(true).setMinValue(0).setMaxValue(21600)));
+
+cmd(new SlashCommandBuilder().setName('ticket').setDescription('Ticket system')
+  .addSubcommand(s => s.setName('setup').setDescription('Configure ticket category & support role')
+    .addChannelOption(o => o.setName('category').setDescription('Category for tickets').addChannelTypes(ChannelType.GuildCategory).setRequired(true))
+    .addRoleOption(o => o.setName('supportrole').setDescription('Support role').setRequired(true))
+    .addChannelOption(o => o.setName('logchannel').setDescription('Ticket log channel')))
+  .addSubcommand(s => s.setName('panel').setDescription('Post a ticket creation panel')
+    .addStringOption(o => o.setName('title').setDescription('Panel title').setRequired(true))
+    .addStringOption(o => o.setName('description').setDescription('Panel description').setRequired(true)))
+  .addSubcommand(s => s.setName('panels').setDescription('List ticket panels'))
+  .addSubcommand(s => s.setName('editpanel').setDescription('Edit a panel')
+    .addIntegerOption(o => o.setName('id').setDescription('Panel ID').setRequired(true))
+    .addStringOption(o => o.setName('title').setDescription('New title'))
+    .addStringOption(o => o.setName('description').setDescription('New description')))
+  .addSubcommand(s => s.setName('deletepanel').setDescription('Delete a panel')
+    .addIntegerOption(o => o.setName('id').setDescription('Panel ID').setRequired(true)))
+  .addSubcommand(s => s.setName('closeall').setDescription('Close all open tickets'))
+  .addSubcommand(s => s.setName('add').setDescription('Add a user to this ticket').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
+  .addSubcommand(s => s.setName('remove').setDescription('Remove a user from this ticket').addUserOption(o => o.setName('user').setDescription('User').setRequired(true)))
+  .addSubcommand(s => s.setName('close').setDescription('Close this ticket'))
+  .addSubcommand(s => s.setName('claim').setDescription('Claim this ticket'))
+  .addSubcommand(s => s.setName('transcript').setDescription('Generate a transcript for this ticket'))
+  .addSubcommand(s => s.setName('stats').setDescription('Show ticket statistics'))
+  .addSubcommand(s => s.setName('addtype').setDescription('Add a ticket type')
+    .addStringOption(o => o.setName('name').setDescription('Type name').setRequired(true))
+    .addStringOption(o => o.setName('emoji').setDescription('Emoji')))
+  .addSubcommand(s => s.setName('listtypes').setDescription('List ticket types'))
+  .addSubcommand(s => s.setName('edittype').setDescription('Edit a ticket type')
+    .addStringOption(o => o.setName('name').setDescription('Type name').setRequired(true))
+    .addStringOption(o => o.setName('emoji').setDescription('New emoji').setRequired(true)))
+  .addSubcommand(s => s.setName('deletetype').setDescription('Delete a ticket type')
+    .addStringOption(o => o.setName('name').setDescription('Type name').setRequired(true)))
+  .addSubcommand(s => s.setName('config').setDescription('Show ticket configuration')));
+
+cmd(new SlashCommandBuilder().setName('welcome').setDescription('Welcome message system')
+  .addSubcommand(s => s.setName('setup').setDescription('Configure welcome messages')
+    .addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true))
+    .addStringOption(o => o.setName('message').setDescription('Message ({user},{username},{server},{membercount})')))
+  .addSubcommand(s => s.setName('test').setDescription('Send a test welcome message'))
+  .addSubcommand(s => s.setName('disable').setDescription('Disable welcome messages')));
+
+cmd(new SlashCommandBuilder().setName('goodbye').setDescription('Goodbye message system')
+  .addSubcommand(s => s.setName('setup').setDescription('Configure goodbye messages')
+    .addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true))
+    .addStringOption(o => o.setName('message').setDescription('Message ({user},{username},{server},{membercount})')))
+  .addSubcommand(s => s.setName('test').setDescription('Send a test goodbye message'))
+  .addSubcommand(s => s.setName('disable').setDescription('Disable goodbye messages')));
+
+cmd(new SlashCommandBuilder().setName('dm').setDescription('DM system')
+  .addSubcommand(s => s.setName('user').setDescription('DM a single user')
+    .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+    .addStringOption(o => o.setName('message').setDescription('Message').setRequired(true)))
+  .addSubcommand(s => s.setName('role').setDescription('DM all members with a role')
+    .addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true))
+    .addStringOption(o => o.setName('message').setDescription('Message').setRequired(true)))
+  .addSubcommand(s => s.setName('everyone').setDescription('DM all server members (rate-limited, slow)')
+    .addStringOption(o => o.setName('message').setDescription('Message').setRequired(true))));
+cmd(new SlashCommandBuilder().setName('dmlogs').setDescription('Show recent DM activity'));
+
+cmd(new SlashCommandBuilder().setName('invites').setDescription('Show your (or another user\'s) invite stats')
+  .addUserOption(o => o.setName('user').setDescription('User')));
+cmd(new SlashCommandBuilder().setName('inviteleaderboard').setDescription('Show invite leaderboard'));
+cmd(new SlashCommandBuilder().setName('resetinvites').setDescription('Reset all invite statistics'));
+
+cmd(new SlashCommandBuilder().setName('customcommand').setDescription('Manage custom commands')
+  .addSubcommand(s => s.setName('add').setDescription('Add a custom command')
+    .addStringOption(o => o.setName('name').setDescription('Trigger name').setRequired(true))
+    .addStringOption(o => o.setName('response').setDescription('Response text').setRequired(true)))
+  .addSubcommand(s => s.setName('remove').setDescription('Remove a custom command').addStringOption(o => o.setName('name').setDescription('Trigger name').setRequired(true)))
+  .addSubcommand(s => s.setName('list').setDescription('List custom commands')));
+
+cmd(new SlashCommandBuilder().setName('giveaway').setDescription('Giveaway system')
+  .addSubcommand(s => s.setName('start').setDescription('Start a giveaway')
+    .addStringOption(o => o.setName('prize').setDescription('Prize').setRequired(true))
+    .addStringOption(o => o.setName('duration').setDescription('e.g. 10m, 1h, 1d').setRequired(true))
+    .addIntegerOption(o => o.setName('winners').setDescription('Number of winners').setRequired(true).setMinValue(1)))
+  .addSubcommand(s => s.setName('end').setDescription('End a giveaway early').addStringOption(o => o.setName('messageid').setDescription('Giveaway message ID').setRequired(true)))
+  .addSubcommand(s => s.setName('reroll').setDescription('Reroll a giveaway winner').addStringOption(o => o.setName('messageid').setDescription('Giveaway message ID').setRequired(true))));
+
+cmd(new SlashCommandBuilder().setName('statusmonitor').setDescription('Website status monitor')
+  .addSubcommand(s => s.setName('add').setDescription('Add a URL to monitor')
+    .addStringOption(o => o.setName('url').setDescription('URL (https://...)').setRequired(true))
+    .addChannelOption(o => o.setName('channel').setDescription('Channel for status updates').setRequired(true)))
+  .addSubcommand(s => s.setName('remove').setDescription('Remove a monitored URL').addStringOption(o => o.setName('url').setDescription('URL').setRequired(true)))
+  .addSubcommand(s => s.setName('list').setDescription('List monitored URLs')));
+
+cmd(new SlashCommandBuilder().setName('weather').setDescription('Get weather for a location').addStringOption(o => o.setName('location').setDescription('City name').setRequired(true)));
+cmd(new SlashCommandBuilder().setName('qrcode').setDescription('Generate a QR code').addStringOption(o => o.setName('text').setDescription('Text or URL to encode').setRequired(true)));
+cmd(new SlashCommandBuilder().setName('remindme').setDescription('Set a reminder')
+  .addStringOption(o => o.setName('when').setDescription('e.g. 10m, 1h, 2d').setRequired(true))
+  .addStringOption(o => o.setName('text').setDescription('What to remind you about').setRequired(true)));
+cmd(new SlashCommandBuilder().setName('poll').setDescription('Create a poll')
+  .addStringOption(o => o.setName('question').setDescription('Poll question').setRequired(true))
+  .addStringOption(o => o.setName('options').setDescription('Comma-separated options (max 5)')));
+cmd(new SlashCommandBuilder().setName('afk').setDescription('Set your AFK status').addStringOption(o => o.setName('reason').setDescription('Reason')));
+
+cmd(new SlashCommandBuilder().setName('serverinfo').setDescription('Show server information'));
+cmd(new SlashCommandBuilder().setName('userinfo').setDescription('Show user information').addUserOption(o => o.setName('user').setDescription('User')));
+cmd(new SlashCommandBuilder().setName('roleinfo').setDescription('Show role information').addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true)));
+cmd(new SlashCommandBuilder().setName('avatar').setDescription('Show a user\'s avatar').addUserOption(o => o.setName('user').setDescription('User')));
+cmd(new SlashCommandBuilder().setName('banner').setDescription('Show a user\'s banner').addUserOption(o => o.setName('user').setDescription('User')));
+cmd(new SlashCommandBuilder().setName('membercount').setDescription('Show member count statistics'));
+cmd(new SlashCommandBuilder().setName('ping').setDescription('Show bot latency'));
+cmd(new SlashCommandBuilder().setName('stats').setDescription('Show bot statistics'));
+cmd(new SlashCommandBuilder().setName('help').setDescription('Show the help menu'));
+
+cmd(new SlashCommandBuilder().setName('autorole').setDescription('Automatic role on join')
+  .addSubcommand(s => s.setName('set').setDescription('Set the autorole').addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true)))
+  .addSubcommand(s => s.setName('remove').setDescription('Remove the autorole')));
+
+cmd(new SlashCommandBuilder().setName('stickyroles').setDescription('Sticky roles system')
+  .addSubcommand(s => s.setName('enable').setDescription('Enable sticky roles'))
+  .addSubcommand(s => s.setName('disable').setDescription('Disable sticky roles')));
+
+cmd(new SlashCommandBuilder().setName('addrole').setDescription('Add a role to a member')
+  .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+  .addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true)));
+cmd(new SlashCommandBuilder().setName('removerole').setDescription('Remove a role from a member')
+  .addUserOption(o => o.setName('user').setDescription('User').setRequired(true))
+  .addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true)));
+
+cmd(new SlashCommandBuilder().setName('verifyconfig').setDescription('Configure the verification system')
+  .addRoleOption(o => o.setName('role').setDescription('Role to grant on verify').setRequired(true))
+  .addChannelOption(o => o.setName('channel').setDescription('Verification channel').setRequired(true)));
+cmd(new SlashCommandBuilder().setName('verify').setDescription('Post the verification button in the configured channel'));
+
+cmd(new SlashCommandBuilder().setName('serverstats').setDescription('Live statistic voice channels')
+  .addSubcommand(s => s.setName('setup').setDescription('Create statistic channels'))
+  .addSubcommand(s => s.setName('remove').setDescription('Remove statistic channels')));
+
+cmd(new SlashCommandBuilder().setName('starboard').setDescription('Starboard system')
+  .addSubcommand(s => s.setName('setup').setDescription('Configure the starboard')
+    .addChannelOption(o => o.setName('channel').setDescription('Starboard channel').setRequired(true))
+    .addIntegerOption(o => o.setName('threshold').setDescription('Star threshold').setRequired(true).setMinValue(1)))
+  .addSubcommand(s => s.setName('remove').setDescription('Disable the starboard')));
+
+cmd(new SlashCommandBuilder().setName('reactionrole').setDescription('Reaction role system')
+  .addSubcommand(s => s.setName('add').setDescription('Add a reaction role')
+    .addStringOption(o => o.setName('messageid').setDescription('Message ID').setRequired(true))
+    .addStringOption(o => o.setName('emoji').setDescription('Emoji').setRequired(true))
+    .addRoleOption(o => o.setName('role').setDescription('Role').setRequired(true)))
+  .addSubcommand(s => s.setName('remove').setDescription('Remove a reaction role')
+    .addStringOption(o => o.setName('messageid').setDescription('Message ID').setRequired(true))
+    .addStringOption(o => o.setName('emoji').setDescription('Emoji').setRequired(true)))
+  .addSubcommand(s => s.setName('list').setDescription('List reaction roles')));
+
+cmd(new SlashCommandBuilder().setName('autopublish').setDescription('Auto-publish announcement channels')
+  .addSubcommand(s => s.setName('setup').setDescription('Add an announcement channel to auto-publish').addChannelOption(o => o.setName('channel').setDescription('Announcement channel').setRequired(true)))
+  .addSubcommand(s => s.setName('remove').setDescription('Remove an auto-publish channel').addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true))));
+
+// ---------------------------------------------------------------------------
+// COMMAND METADATA FOR /help (category + min level)
+// ---------------------------------------------------------------------------
+const HELP_CATEGORIES = {
+  'SUPER ADMIN': ['superadmin', 'botconfig'],
+  'SECURITY': ['antinuke', 'antispam', 'badwords'],
+  'MODERATION': ['ban', 'kick', 'timeout', 'warn', 'warnings', 'clearwarns', 'purge', 'lock', 'unlock', 'slowmode'],
+  'TICKETS': ['ticket'],
+  'WELCOME & GOODBYE': ['welcome', 'goodbye'],
+  'DM SYSTEM': ['dm', 'dmlogs'],
+  'INVITES': ['invites', 'inviteleaderboard', 'resetinvites'],
+  'UTILITY & TOOLS': ['customcommand', 'giveaway', 'statusmonitor', 'weather', 'qrcode', 'remindme', 'poll', 'afk'],
+  'INFORMATION': ['serverinfo', 'userinfo', 'roleinfo', 'avatar', 'banner', 'membercount', 'ping', 'stats', 'help'],
+  'SERVER MANAGEMENT': ['autorole', 'stickyroles', 'addrole', 'removerole', 'verifyconfig', 'verify', 'serverstats', 'extraowner'],
+  'FUN & ENGAGEMENT': ['starboard', 'reactionrole', 'autopublish'],
+};
+
+// ---------------------------------------------------------------------------
+// REGISTRATION
+// ---------------------------------------------------------------------------
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  const body = commands.map(c => c.toJSON());
+  const guildId = process.env.GUILD_ID;
+  try {
+    if (guildId) {
+      await rest.put(Routes.applicationGuildCommands(process.env.CLIENT_ID, guildId), { body });
+      console.log(`Registered ${body.length} guild commands to ${guildId}.`);
+    } else {
+      await rest.put(Routes.applicationCommands(process.env.CLIENT_ID), { body });
+      console.log(`Registered ${body.length} global commands.`);
+    }
+  } catch (e) {
+    console.error('Command registration failed:', e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DURATION PARSER
+// ---------------------------------------------------------------------------
+function parseDuration(str) {
+  const m = /^(\d+)\s*(s|m|h|d|w)$/i.exec(str.trim());
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  const mult = { s: 1000, m: 60000, h: 3600000, d: 86400000, w: 604800000 }[m[2].toLowerCase()];
+  return n * mult;
+}
+
+// ---------------------------------------------------------------------------
+// MODERATION HELPERS
+// ---------------------------------------------------------------------------
+async function tryDM(user, embed) {
+  try { await user.send({ embeds: [embed] }); return true; } catch { return false; }
+}
+
+// ---------------------------------------------------------------------------
+// ANTI-NUKE TRACKING
+// ---------------------------------------------------------------------------
+const nukeTracker = new Map(); // guildId -> { userId -> { action -> [timestamps] } }
+
+function trackAction(guildId, userId, action) {
+  if (!nukeTracker.has(guildId)) nukeTracker.set(guildId, new Map());
+  const g = nukeTracker.get(guildId);
+  if (!g.has(userId)) g.set(userId, {});
+  const arr = g.get(userId)[action] || [];
+  arr.push(Date.now());
+  g.get(userId)[action] = arr;
+  return arr;
+}
+
+async function checkAntinuke(guild, executorId, action, entity) {
+  const gconf = getGuild(guild.id);
+  if (!gconf.antinuke.enabled) return;
+  if (isProtected(guild, gconf, executorId)) return;
+  if (gconf.antinuke.whitelist.includes(executorId)) return;
+  const th = gconf.antinuke.thresholds;
+  const windowMs = gconf.antinuke.windowMs;
+  const arr = trackAction(guild.id, executorId, action).filter(t => Date.now() - t < windowMs);
+  const limit = th[action];
+  if (!limit || arr.length < limit) return;
+
+  // Trigger response
+  const member = await guild.members.fetch(executorId).catch(() => null);
+  let punished = false;
+  if (member && botCanActOn(guild, member)) {
+    try {
+      // strip dangerous roles/permissions
+      const dangerousRoles = member.roles.cache.filter(r =>
+        r.permissions.has(PermissionFlagsBits.Administrator) ||
+        r.permissions.has(PermissionFlagsBits.ManageGuild) ||
+        r.permissions.has(PermissionFlagsBits.ManageChannels) ||
+        r.permissions.has(PermissionFlagsBits.ManageRoles) ||
+        r.permissions.has(PermissionFlagsBits.BanMembers));
+      for (const [, role] of dangerousRoles) {
+        await member.roles.remove(role, 'Anti-nuke: dangerous mass action detected').catch(() => {});
+      }
+      await member.timeout(10 * 60 * 1000, 'Anti-nuke: dangerous mass action detected').catch(() => {});
+      punished = true;
+    } catch (e) { /* ignore */ }
+  }
+
+  const entry = { action, executorId, ts: Date.now(), punished };
+  gconf.antinuke.logs.unshift(entry);
+  gconf.antinuke.logs = gconf.antinuke.logs.slice(0, 100);
+  saveDB();
+
+  const embed = new EmbedBuilder().setColor(COLORS.error)
+    .setTitle('🛡️ Anti-Nuke Triggered')
+    .setDescription(`Suspicious activity detected: **${action}**`)
+    .addFields(
+      { name: 'Executor', value: `<@${executorId}> (${executorId})`, inline: true },
+      { name: 'Occurrences', value: `${arr.length} within ${Math.round(windowMs / 1000)}s`, inline: true },
+      { name: 'Action Taken', value: punished ? 'Dangerous roles stripped + 10m timeout' : 'Could not act (hierarchy/permissions)', inline: false },
+    ).setTimestamp();
+
+  if (gconf.antinuke.logChannel) {
+    const ch = await guild.channels.fetch(gconf.antinuke.logChannel).catch(() => null);
+    if (ch) ch.send({ embeds: [embed] }).catch(() => {});
+  }
+}
+
+// ---------------------------------------------------------------------------
+// ANTI-SPAM TRACKING
+// ---------------------------------------------------------------------------
+const spamTracker = new Map(); // userId -> { timestamps: [], lastMsgs: [] }
+const inviteRegex = /(discord\.gg|discord\.com\/invite)\/\S+/i;
+const linkRegex = /https?:\/\/\S+/gi;
+
+async function handleAntispam(message) {
+  const gconf = getGuild(message.guild.id);
+  if (!gconf.antispam.enabled) return;
+  if (isProtected(message.guild, gconf, message.author.id)) return;
+  const member = message.member;
+  if (member?.permissions.has(PermissionFlagsBits.ManageMessages)) return;
+
+  const key = `${message.guild.id}:${message.author.id}`;
+  if (!spamTracker.has(key)) spamTracker.set(key, { timestamps: [], lastMsgs: [] });
+  const tr = spamTracker.get(key);
+  const now = Date.now();
+  tr.timestamps.push(now);
+  tr.timestamps = tr.timestamps.filter(t => now - t < gconf.antispam.msgWindowMs);
+  tr.lastMsgs.push({ content: message.content, ts: now });
+  tr.lastMsgs = tr.lastMsgs.filter(m => now - m.ts < gconf.antispam.duplicateWindowMs);
+
+  let violation = null;
+
+  if (tr.timestamps.length > gconf.antispam.msgLimit) violation = 'Message flood';
+  else if (tr.lastMsgs.filter(m => m.content === message.content && message.content.length > 0).length >= 3) violation = 'Duplicate messages';
+  else if (message.mentions.users.size >= gconf.antispam.mentionLimit) violation = 'Mention spam';
+  else if (gconf.antispam.blockInvites && inviteRegex.test(message.content)) violation = 'Discord invite link';
+  else {
+    const links = message.content.match(linkRegex) || [];
+    if (links.length >= gconf.antispam.linkLimit) violation = 'Link spam';
+  }
+  if (!violation) {
+    const letters = message.content.replace(/[^a-zA-Z]/g, '');
+    if (letters.length >= 8) {
+      const caps = letters.replace(/[^A-Z]/g, '').length;
+      if ((caps / letters.length) * 100 >= gconf.antispam.capsPercent) violation = 'Excessive caps';
+    }
+  }
+  if (!violation) {
+    const repeated = /(.)\1{7,}/.exec(message.content);
+    if (repeated && repeated[0].length >= gconf.antispam.repeatedCharLimit) violation = 'Repeated characters';
+  }
+  if (!gconf.badwords) gconf.badwords = [];
+  if (!violation && gconf.badwords.length) {
+    const lower = message.content.toLowerCase();
+    if (gconf.badwords.some(w => lower.includes(w.toLowerCase()))) violation = 'Bad word';
+  }
+
+  if (!violation) return;
+
+  await message.delete().catch(() => {});
+
+  // escalation
+  const wkey = `${message.guild.id}_offense`;
+  if (!gconf.warnings[message.author.id]) gconf.warnings[message.author.id] = [];
+  const priorOffenses = gconf.warnings[message.author.id].filter(w => w.reason.startsWith('[AutoMod]')).length;
+  const reasonText = `[AutoMod] ${violation}`;
+  gconf.warnings[message.author.id].push({ reason: reasonText, mod: 'AutoMod', ts: Date.now() });
+  saveDB();
+
+  let actionTaken = 'Warned';
+  try {
+    if (priorOffenses === 0) {
+      actionTaken = 'Deleted + Warned';
+    } else if (priorOffenses === 1) {
+      await member.timeout(5 * 60 * 1000, reasonText).catch(() => {});
+      actionTaken = 'Deleted + 5m Timeout';
+    } else if (priorOffenses === 2) {
+      await member.timeout(30 * 60 * 1000, reasonText).catch(() => {});
+      actionTaken = 'Deleted + 30m Timeout';
+    } else if (priorOffenses >= 3 && priorOffenses < 5) {
+      await member.timeout(6 * 60 * 60 * 1000, reasonText).catch(() => {});
+      actionTaken = 'Deleted + 6h Timeout';
+    } else {
+      await member.kick(reasonText).catch(() => {});
+      actionTaken = 'Deleted + Kicked';
+    }
+  } catch (e) { /* missing perms etc */ }
+
+  const embed = new EmbedBuilder().setColor(COLORS.warning)
+    .setTitle('🚨 AutoMod Action')
+    .addFields(
+      { name: 'User', value: `<@${message.author.id}>`, inline: true },
+      { name: 'Violation', value: violation, inline: true },
+      { name: 'Action', value: actionTaken, inline: true },
+      { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+    ).setTimestamp();
+  if (gconf.antispam.logChannel) {
+    const ch = await message.guild.channels.fetch(gconf.antispam.logChannel).catch(() => null);
+    if (ch) ch.send({ embeds: [embed] }).catch(() => {});
+  }
+  await logEvent(message.guild, gconf, embed);
+}
+
+// ---------------------------------------------------------------------------
+// HELP MENU BUILDER
+// ---------------------------------------------------------------------------
+function buildHelpPages() {
+  const cats = Object.entries(HELP_CATEGORIES);
+  const perPage = Math.ceil(cats.length / 2);
+  const pages = [];
+  for (let i = 0; i < 2; i++) {
+    const slice = cats.slice(i * perPage, (i + 1) * perPage);
+    const embed = new EmbedBuilder()
+      .setColor(COLORS.info)
+      .setTitle('📖 All-in-One Discord Bot — Help Menu')
+      .setFooter({ text: `All-in-One Discord Bot • Page ${i + 1}/2 • ${commands.length} commands registered` })
+      .setTimestamp();
+    for (const [cat, list] of slice) {
+      embed.addFields({ name: cat, value: list.map(c => `\`/${c}\``).join(', ') });
+    }
+    pages.push(embed);
+  }
+  return pages;
+}
+
+function helpButtons(page) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('help_prev').setLabel('◀ Page 1').setStyle(ButtonStyle.Secondary).setDisabled(page === 0),
+    new ButtonBuilder().setCustomId('help_next').setLabel('Page 2 ▶').setStyle(ButtonStyle.Secondary).setDisabled(page === 1),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// BOTCONFIG PANEL
+// ---------------------------------------------------------------------------
+function botconfigMenu() {
+  const row = new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder().setCustomId('botconfig_select').setPlaceholder('Select a system to configure').addOptions(
+      { label: 'Welcome', value: 'welcome', emoji: '👋' },
+      { label: 'Goodbye', value: 'goodbye', emoji: '👋' },
+      { label: 'Anti-Spam', value: 'antispam', emoji: '🛡️' },
+      { label: 'Anti-Nuke', value: 'antinuke', emoji: '💣' },
+      { label: 'Bad Words', value: 'badwords', emoji: '🤬' },
+      { label: 'Tickets', value: 'tickets', emoji: '🎫' },
+      { label: 'Verification', value: 'verification', emoji: '✅' },
+      { label: 'Autorole', value: 'autorole', emoji: '🎭' },
+      { label: 'Sticky Roles', value: 'stickyroles', emoji: '📌' },
+      { label: 'Starboard', value: 'starboard', emoji: '⭐' },
+      { label: 'Reaction Roles', value: 'reactionroles', emoji: '🔘' },
+      { label: 'Auto Publish', value: 'autopublish', emoji: '📢' },
+      { label: 'Server Statistics', value: 'serverstats', emoji: '📊' },
+      { label: 'Logging', value: 'logging', emoji: '📝' },
+    ),
+  );
+  return row;
+}
+
+function configSummaryEmbed(gconf, section) {
+  const e = new EmbedBuilder().setColor(COLORS.neutral).setTitle(`⚙️ Configuration — ${section}`).setTimestamp();
+  switch (section) {
+    case 'welcome': e.setDescription(`Enabled: **${gconf.welcome.enabled}**\nChannel: ${gconf.welcome.channelId ? `<#${gconf.welcome.channelId}>` : 'none'}\nMessage: ${gconf.welcome.message}`); break;
+    case 'goodbye': e.setDescription(`Enabled: **${gconf.goodbye.enabled}**\nChannel: ${gconf.goodbye.channelId ? `<#${gconf.goodbye.channelId}>` : 'none'}\nMessage: ${gconf.goodbye.message}`); break;
+    case 'antispam': e.setDescription(`Enabled: **${gconf.antispam.enabled}**\nUse \`/antispam config\` to edit thresholds.\n${JSON.stringify(gconf.antispam, null, 2).slice(0, 900)}`); break;
+    case 'antinuke': e.setDescription(`Enabled: **${gconf.antinuke.enabled}**\nUse \`/antinuke config\` to edit thresholds.\n${JSON.stringify(gconf.antinuke.thresholds, null, 2)}`); break;
+    case 'badwords': e.setDescription(`${gconf.badwords.length} word(s) configured. Use \`/badwords add|remove|list\`.`); break;
+    case 'tickets': e.setDescription(`Category: ${gconf.tickets.categoryId ? `<#${gconf.tickets.categoryId}>` : 'not set'}\nSupport roles: ${gconf.tickets.supportRoles.map(r => `<@&${r}>`).join(', ') || 'none'}\nOpen tickets: ${Object.keys(gconf.tickets.openTickets).length}`); break;
+    case 'verification': e.setDescription(`Enabled: **${gconf.verification.enabled}**\nRole: ${gconf.verification.roleId ? `<@&${gconf.verification.roleId}>` : 'none'}\nChannel: ${gconf.verification.channelId ? `<#${gconf.verification.channelId}>` : 'none'}`); break;
+    case 'autorole': e.setDescription(`Role: ${gconf.autorole.roleId ? `<@&${gconf.autorole.roleId}>` : 'none set'}\nUse \`/autorole set|remove\`.`); break;
+    case 'stickyroles': e.setDescription(`Enabled: **${gconf.stickyroles.enabled}**`); break;
+    case 'starboard': e.setDescription(`Enabled: **${gconf.starboard.enabled}**\nChannel: ${gconf.starboard.channelId ? `<#${gconf.starboard.channelId}>` : 'none'}\nThreshold: ${gconf.starboard.threshold}`); break;
+    case 'reactionroles': e.setDescription(`${gconf.reactionroles.length} reaction role(s) configured. Use \`/reactionrole add|remove|list\`.`); break;
+    case 'autopublish': e.setDescription(`Channels: ${gconf.autopublish.channels.map(c => `<#${c}>`).join(', ') || 'none'}`); break;
+    case 'serverstats': e.setDescription(`Channels configured: ${Object.keys(gconf.serverstats.channels).length}. Use \`/serverstats setup|remove\`.`); break;
+    case 'logging': e.setDescription(`Log channel: ${gconf.logging.channelId ? `<#${gconf.logging.channelId}>` : 'not set'}`); break;
+    default: e.setDescription('Unknown section.');
+  }
+  return e;
+}
+
+// ---------------------------------------------------------------------------
+// STATUS MONITOR LOOP
+// ---------------------------------------------------------------------------
+function checkUrl(url) {
+  return new Promise((resolve) => {
+    try {
+      const req = https.get(url, { timeout: 8000 }, (res) => {
+        resolve(res.statusCode < 400);
+        res.resume();
+      });
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+    } catch { resolve(false); }
+  });
+}
+
+async function statusMonitorTick() {
+  for (const [guildId, gconf] of Object.entries(db.guilds)) {
+    if (!gconf.statusmonitors?.length) continue;
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) continue;
+    for (const mon of gconf.statusmonitors) {
+      const online = await checkUrl(mon.url);
+      const status = online ? 'online' : 'offline';
+      if (mon.lastStatus !== status) {
+        mon.lastStatus = status;
+        saveDB();
+        const ch = await guild.channels.fetch(mon.channelId).catch(() => null);
+        if (ch) {
+          const embed = online ? successEmbed(`${mon.url} is back **online**.`, 'Status Update') : errorEmbed(`${mon.url} appears to be **offline**.`, 'Status Update');
+          ch.send({ embeds: [embed] }).catch(() => {});
+        }
+      }
+    }
+  }
+}
+setInterval(statusMonitorTick, 5 * 60 * 1000);
+
+// ---------------------------------------------------------------------------
+// REMINDER LOOP
+// ---------------------------------------------------------------------------
+async function reminderTick() {
+  const now = Date.now();
+  for (const gconf of Object.values(db.guilds)) {
+    if (!gconf.reminders?.length) continue;
+    const due = gconf.reminders.filter(r => r.remindAt <= now);
+    if (!due.length) continue;
+    gconf.reminders = gconf.reminders.filter(r => r.remindAt > now);
+    saveDB();
+    for (const r of due) {
+      const user = await client.users.fetch(r.userId).catch(() => null);
+      if (!user) continue;
+      const embed = infoEmbed(r.text, '⏰ Reminder');
+      const ok = await tryDM(user, embed);
+      if (!ok) {
+        const ch = await client.channels.fetch(r.channelId).catch(() => null);
+        if (ch) ch.send({ content: `<@${r.userId}>`, embeds: [embed] }).catch(() => {});
+      }
+    }
+  }
+}
+setInterval(reminderTick, 15000);
+
+// ---------------------------------------------------------------------------
+// GIVEAWAY LOOP
+// ---------------------------------------------------------------------------
+async function endGiveaway(guild, messageId, gconf, forcedWinners = null) {
+  const g = gconf.giveaways[messageId];
+  if (!g || g.ended) return;
+  g.ended = true;
+  const channel = await guild.channels.fetch(g.channelId).catch(() => null);
+  let winners = [];
+  if (forcedWinners) {
+    winners = forcedWinners;
+  } else {
+    const pool = [...g.entrants];
+    for (let i = 0; i < g.winners && pool.length; i++) {
+      const idx = Math.floor(Math.random() * pool.length);
+      winners.push(pool.splice(idx, 1)[0]);
+    }
+  }
+  saveDB();
+  if (channel) {
+    const embed = new EmbedBuilder().setColor(COLORS.success).setTitle('🎉 Giveaway Ended')
+      .setDescription(winners.length ? `Prize: **${g.prize}**\nWinner(s): ${winners.map(w => `<@${w}>`).join(', ')}` : `Prize: **${g.prize}**\nNo valid entrants — no winner.`)
+      .setTimestamp();
+    channel.send({ embeds: [embed] }).catch(() => {});
+    const msg = await channel.messages.fetch(messageId).catch(() => null);
+    if (msg) {
+      const disabledRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('giveaway_ended').setLabel('🎉 Ended').setStyle(ButtonStyle.Secondary).setDisabled(true));
+      msg.edit({ components: [disabledRow] }).catch(() => {});
+    }
+  }
+  return winners;
+}
+
+async function giveawayTick() {
+  const now = Date.now();
+  for (const [guildId, gconf] of Object.entries(db.guilds)) {
+    if (!gconf.giveaways) continue;
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) continue;
+    for (const [msgId, g] of Object.entries(gconf.giveaways)) {
+      if (!g.ended && g.endsAt <= now) {
+        await endGiveaway(guild, msgId, gconf);
+      }
+    }
+  }
+}
+setInterval(giveawayTick, 15000);
+
+// ---------------------------------------------------------------------------
+// SERVER STATS UPDATE LOOP
+// ---------------------------------------------------------------------------
+async function serverStatsTick() {
+  for (const [guildId, gconf] of Object.entries(db.guilds)) {
+    const chans = gconf.serverstats?.channels;
+    if (!chans || !Object.keys(chans).length) continue;
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) continue;
+    await guild.members.fetch().catch(() => {});
+    const members = guild.members.cache;
+    const bots = members.filter(m => m.user.bot).size;
+    const humans = members.size - bots;
+    const online = members.filter(m => m.presence && m.presence.status !== 'offline').size;
+    const values = {
+      members: `Members: ${guild.memberCount}`,
+      bots: `Bots: ${bots}`,
+      humans: `Humans: ${humans}`,
+      online: `Online: ${online}`,
+      boosts: `Boosts: ${guild.premiumSubscriptionCount || 0}`,
+    };
+    for (const [key, chId] of Object.entries(chans)) {
+      const ch = guild.channels.cache.get(chId);
+      if (ch && values[key] && ch.name !== values[key]) {
+        ch.setName(values[key]).catch(() => {});
+      }
+    }
+  }
+}
+setInterval(serverStatsTick, 10 * 60 * 1000);
+
+// ---------------------------------------------------------------------------
+// EVENT: READY
+// ---------------------------------------------------------------------------
+client.once('clientReady', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  await registerCommands();
+  client.user.setPresence({ activities: [{ name: '/help' }], status: 'online' });
+});
+
+// ---------------------------------------------------------------------------
+// EVENT: GUILD MEMBER ADD (welcome, autorole, stickyroles, invites, antinuke join-spam)
+// ---------------------------------------------------------------------------
+const joinTracker = new Map(); // guildId -> timestamps
+
+client.on('guildMemberAdd', async (member) => {
+  const gconf = getGuild(member.guild.id);
+
+  // raid detection (join spam)
+  const arr = joinTracker.get(member.guild.id) || [];
+  arr.push(Date.now());
+  const recent = arr.filter(t => Date.now() - t < 10000);
+  joinTracker.set(member.guild.id, recent);
+  if (gconf.antinuke.enabled && recent.length >= 10) {
+    const embed = warnEmbed(`Rapid join detected: ${recent.length} joins in 10s. Consider enabling verification or lockdown.`, 'Possible Raid');
+    if (gconf.antinuke.logChannel) {
+      const ch = await member.guild.channels.fetch(gconf.antinuke.logChannel).catch(() => null);
+      if (ch) ch.send({ embeds: [embed] }).catch(() => {});
+    }
+  }
+
+  // autorole
+  if (gconf.autorole.roleId) {
+    const role = member.guild.roles.cache.get(gconf.autorole.roleId);
+    if (role) await member.roles.add(role).catch(() => {});
+  }
+
+  // sticky roles
+  if (gconf.stickyroles.enabled && gconf.stickyroles.store[member.id]) {
+    const roleIds = gconf.stickyroles.store[member.id].filter(id => member.guild.roles.cache.has(id));
+    if (roleIds.length) await member.roles.add(roleIds).catch(() => {});
+  }
+
+  // invite tracking
+  try {
+    const newInvites = await member.guild.invites.fetch();
+    const cache = gconf.invites.cache;
+    let usedCode = null;
+    for (const [code, invite] of newInvites) {
+      const prev = cache[code] || 0;
+      if (invite.uses > prev) { usedCode = code; }
+      cache[code] = invite.uses;
+    }
+    if (usedCode) {
+      const invite = newInvites.get(usedCode);
+      const inviterId = invite.inviter?.id;
+      gconf.invites.joins[member.id] = { code: usedCode, inviter: inviterId };
+      if (inviterId) gconf.invites.leaders[inviterId] = (gconf.invites.leaders[inviterId] || 0) + 1;
+    }
+    saveDB();
+  } catch (e) { /* missing ManageGuild permission */ }
+
+  // welcome message
+  if (gconf.welcome.enabled && gconf.welcome.channelId) {
+    const ch = await member.guild.channels.fetch(gconf.welcome.channelId).catch(() => null);
+    if (ch) {
+      const text = replaceVars(gconf.welcome.message, { user: member.user, guild: member.guild });
+      if (gconf.welcome.embed) {
+        const embed = new EmbedBuilder().setColor(COLORS.success).setTitle('👋 Welcome!').setDescription(text)
+          .setThumbnail(member.user.displayAvatarURL()).setTimestamp();
+        ch.send({ embeds: [embed] }).catch(() => {});
+      } else {
+        ch.send({ content: text }).catch(() => {});
+      }
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// EVENT: GUILD MEMBER REMOVE (goodbye, sticky role capture)
+// ---------------------------------------------------------------------------
+client.on('guildMemberRemove', async (member) => {
+  const gconf = getGuild(member.guild.id);
+
+  if (gconf.stickyroles.enabled) {
+    const roleIds = member.roles.cache.filter(r => r.id !== member.guild.id).map(r => r.id);
+    gconf.stickyroles.store[member.id] = roleIds;
+    saveDB();
+  }
+
+  if (gconf.goodbye.enabled && gconf.goodbye.channelId) {
+    const ch = await member.guild.channels.fetch(gconf.goodbye.channelId).catch(() => null);
+    if (ch) {
+      const text = replaceVars(gconf.goodbye.message, { user: member.user, guild: member.guild });
+      if (gconf.goodbye.embed) {
+        const embed = new EmbedBuilder().setColor(COLORS.error).setTitle('👋 Goodbye').setDescription(text)
+          .setThumbnail(member.user.displayAvatarURL()).setTimestamp();
+        ch.send({ embeds: [embed] }).catch(() => {});
+      } else {
+        ch.send({ content: text }).catch(() => {});
+      }
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// EVENT: MESSAGE CREATE (antispam, badwords, afk, custom commands)
+// ---------------------------------------------------------------------------
+client.on('messageCreate', async (message) => {
+  if (!message.guild || message.author.bot) return;
+  const gconf = getGuild(message.guild.id);
+
+  // AFK removal
+  if (gconf.afk[message.author.id]) {
+    delete gconf.afk[message.author.id];
+    saveDB();
+    message.reply({ embeds: [infoEmbed('Welcome back — I removed your AFK status.', '👋 AFK Removed')] }).then(m => setTimeout(() => m.delete().catch(() => {}), 5000)).catch(() => {});
+  }
+  // AFK mention notice
+  for (const [, user] of message.mentions.users) {
+    if (gconf.afk[user.id]) {
+      message.reply({ embeds: [infoEmbed(`${user.username} is AFK: ${gconf.afk[user.id].reason}`, '💤 AFK')] }).catch(() => {});
+    }
+  }
+
+  // custom commands (prefix !)
+  if (message.content.startsWith('!')) {
+    const name = message.content.slice(1).split(' ')[0].toLowerCase();
+    if (gconf.customcommands[name]) {
+      message.channel.send({ content: gconf.customcommands[name] }).catch(() => {});
+      return;
+    }
+  }
+
+  await handleAntispam(message).catch(e => console.error('antispam error:', e));
+});
+
+// ---------------------------------------------------------------------------
+// EVENT: MESSAGE REACTION ADD (starboard, reaction roles)
+// ---------------------------------------------------------------------------
+client.on('messageReactionAdd', async (reaction, user) => {
+  if (user.bot) return;
+  try {
+    if (reaction.partial) await reaction.fetch();
+    if (reaction.message.partial) await reaction.message.fetch();
+  } catch { return; }
+  const guild = reaction.message.guild;
+  if (!guild) return;
+  const gconf = getGuild(guild.id);
+
+  // reaction roles
+  const emojiKey = reaction.emoji.id ? `<:${reaction.emoji.name}:${reaction.emoji.id}>` : reaction.emoji.name;
+  const rr = gconf.reactionroles.find(r => r.messageId === reaction.message.id && (r.emoji === emojiKey || r.emoji === reaction.emoji.name));
+  if (rr) {
+    const member = await guild.members.fetch(user.id).catch(() => null);
+    if (member) await member.roles.add(rr.roleId).catch(() => {});
+  }
+
+  // starboard
+  if (gconf.starboard.enabled && ['⭐', '🌟'].includes(reaction.emoji.name)) {
+    const count = reaction.count || 1;
+    if (count >= gconf.starboard.threshold) {
+      const already = gconf.starboard.messages[reaction.message.id];
+      const ch = await guild.channels.fetch(gconf.starboard.channelId).catch(() => null);
+      if (ch) {
+        const embed = new EmbedBuilder().setColor(0xFFD700)
+          .setAuthor({ name: reaction.message.author?.tag || 'Unknown', iconURL: reaction.message.author?.displayAvatarURL() })
+          .setDescription(reaction.message.content || '*[attachment/embed]*')
+          .addFields({ name: 'Jump', value: `[Original message](${reaction.message.url})` })
+          .setTimestamp(reaction.message.createdAt);
+        if (reaction.message.attachments.size) embed.setImage(reaction.message.attachments.first().url);
+        if (already) {
+          const sbMsg = await ch.messages.fetch(already).catch(() => null);
+          if (sbMsg) sbMsg.edit({ content: `⭐ **${count}** | <#${reaction.message.channel.id}>`, embeds: [embed] }).catch(() => {});
+        } else {
+          const sent = await ch.send({ content: `⭐ **${count}** | <#${reaction.message.channel.id}>`, embeds: [embed] }).catch(() => null);
+          if (sent) { gconf.starboard.messages[reaction.message.id] = sent.id; saveDB(); }
+        }
+      }
+    }
+  }
+});
+
+client.on('messageReactionRemove', async (reaction) => {
+  try {
+    if (reaction.partial) await reaction.fetch();
+    if (reaction.message.partial) await reaction.message.fetch();
+  } catch { return; }
+  const guild = reaction.message.guild;
+  if (!guild) return;
+  const gconf = getGuild(guild.id);
+  if (gconf.starboard.enabled && ['⭐', '🌟'].includes(reaction.emoji.name)) {
+    const count = reaction.count || 0;
+    const already = gconf.starboard.messages[reaction.message.id];
+    if (already) {
+      const ch = await guild.channels.fetch(gconf.starboard.channelId).catch(() => null);
+      const sbMsg = ch ? await ch.messages.fetch(already).catch(() => null) : null;
+      if (sbMsg) sbMsg.edit({ content: `⭐ **${count}** | <#${reaction.message.channel.id}>` }).catch(() => {});
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// EVENT: ANTI-NUKE TRIGGERS (channel/role/webhook create-delete, bans)
+// ---------------------------------------------------------------------------
+client.on('channelDelete', async (channel) => {
+  if (!channel.guild) return;
+  const log = await channel.guild.fetchAuditLogs({ type: 12, limit: 1 }).catch(() => null); // CHANNEL_DELETE = 12
+  const entry = log?.entries.first();
+  if (entry && Date.now() - entry.createdTimestamp < 5000) await checkAntinuke(channel.guild, entry.executor.id, 'channelDelete');
+});
+client.on('channelCreate', async (channel) => {
+  if (!channel.guild) return;
+  const log = await channel.guild.fetchAuditLogs({ type: 10, limit: 1 }).catch(() => null); // CHANNEL_CREATE = 10
+  const entry = log?.entries.first();
+  if (entry && Date.now() - entry.createdTimestamp < 5000) await checkAntinuke(channel.guild, entry.executor.id, 'channelCreate');
+});
+client.on('roleDelete', async (role) => {
+  const log = await role.guild.fetchAuditLogs({ type: 32, limit: 1 }).catch(() => null); // ROLE_DELETE = 32
+  const entry = log?.entries.first();
+  if (entry && Date.now() - entry.createdTimestamp < 5000) await checkAntinuke(role.guild, entry.executor.id, 'roleDelete');
+});
+client.on('roleCreate', async (role) => {
+  const log = await role.guild.fetchAuditLogs({ type: 30, limit: 1 }).catch(() => null); // ROLE_CREATE = 30
+  const entry = log?.entries.first();
+  if (entry && Date.now() - entry.createdTimestamp < 5000) await checkAntinuke(role.guild, entry.executor.id, 'roleCreate');
+});
+client.on('guildBanAdd', async (ban) => {
+  const log = await ban.guild.fetchAuditLogs({ type: 22, limit: 1 }).catch(() => null); // MEMBER_BAN_ADD = 22
+  const entry = log?.entries.first();
+  if (entry && Date.now() - entry.createdTimestamp < 5000) await checkAntinuke(ban.guild, entry.executor.id, 'ban');
+});
+client.on('guildMemberRemove', async (member) => {
+  // detect kicks specifically (separate from goodbye handler above; both listeners fire independently)
+  const log = await member.guild.fetchAuditLogs({ type: 20, limit: 1 }).catch(() => null); // MEMBER_KICK = 20
+  const entry = log?.entries.first();
+  if (entry && entry.target?.id === member.id && Date.now() - entry.createdTimestamp < 5000) {
+    await checkAntinuke(member.guild, entry.executor.id, 'kick');
+  }
+});
+client.on('webhooksUpdate', async (channel) => {
+  if (!channel.guild) return;
+  const log = await channel.guild.fetchAuditLogs({ limit: 1 }).catch(() => null);
+  const entry = log?.entries.first();
+  if (entry && [50, 51, 52].includes(entry.action) && Date.now() - entry.createdTimestamp < 5000) {
+    await checkAntinuke(channel.guild, entry.executor.id, 'webhook');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// AUTO-PUBLISH
+// ---------------------------------------------------------------------------
+client.on('messageCreate', async (message) => {
+  if (!message.guild || message.channel.type !== ChannelType.GuildAnnouncement) return;
+  const gconf = getGuild(message.guild.id);
+  if (gconf.autopublish.channels.includes(message.channel.id)) {
+    message.crosspost().catch(() => {});
+  }
+});
+
+// ---------------------------------------------------------------------------
+// INTERACTION HANDLER
+// ---------------------------------------------------------------------------
+client.on('interactionCreate', async (interaction) => {
+  try {
+    if (interaction.isChatInputCommand()) return await handleSlash(interaction);
+    if (interaction.isButton()) return await handleButton(interaction);
+    if (interaction.isStringSelectMenu()) return await handleSelect(interaction);
+    if (interaction.isModalSubmit()) return await handleModal(interaction);
+  } catch (err) {
+    console.error('Interaction error:', err);
+    await safeReply(interaction, { embeds: [errorEmbed('Something went wrong handling that interaction.')], ephemeral: true }).catch(() => {});
+  }
+});
+
+// ---------------------------------------------------------------------------
+// SLASH COMMAND HANDLER
+// ---------------------------------------------------------------------------
+async function handleSlash(interaction) {
+  const { commandName, guild } = interaction;
+  if (!guild) return safeReply(interaction, { embeds: [errorEmbed('This bot only works in servers.')], ephemeral: true });
+  const gconf = getGuild(guild.id);
+
+  switch (commandName) {
+    // ---------------- SUPER ADMIN ----------------
+    case 'superadmin': {
+      if (interaction.member.id !== guild.ownerId && !gconf.superAdmins.includes(interaction.member.id)) {
+        return safeReply(interaction, { embeds: [errorEmbed('Only the server owner or existing super admins can manage this.')], ephemeral: true });
+      }
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'add') {
+        const user = interaction.options.getUser('user');
+        if (!gconf.superAdmins.includes(user.id)) gconf.superAdmins.push(user.id);
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`${user} is now a Super Admin.`)] });
+      }
+      if (sub === 'remove') {
+        const user = interaction.options.getUser('user');
+        gconf.superAdmins = gconf.superAdmins.filter(id => id !== user.id);
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`${user} is no longer a Super Admin.`)] });
+      }
+      if (sub === 'list') {
+        return safeReply(interaction, { embeds: [infoEmbed(gconf.superAdmins.length ? gconf.superAdmins.map(id => `<@${id}>`).join('\n') : 'No super admins configured.', 'Super Admins')] });
+      }
+      break;
+    }
+
+    // ---------------- EXTRA OWNER ----------------
+    case 'extraowner': {
+      if (!requireLevel(interaction, gconf, LEVEL.SUPER_ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Super Admin or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'add') {
+        const user = interaction.options.getUser('user');
+        if (!gconf.extraOwners.includes(user.id)) gconf.extraOwners.push(user.id);
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`${user} is now an Extra Owner (bot-level permissions only).`)] });
+      }
+      if (sub === 'remove') {
+        const user = interaction.options.getUser('user');
+        gconf.extraOwners = gconf.extraOwners.filter(id => id !== user.id);
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`${user} is no longer an Extra Owner.`)] });
+      }
+      if (sub === 'list') {
+        return safeReply(interaction, { embeds: [infoEmbed(gconf.extraOwners.length ? gconf.extraOwners.map(id => `<@${id}>`).join('\n') : 'No extra owners configured.', 'Extra Owners')] });
+      }
+      break;
+    }
+
+    // ---------------- BOTCONFIG ----------------
+    case 'botconfig': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      return safeReply(interaction, { embeds: [infoEmbed('Select a system below to view/configure it.', '⚙️ Bot Configuration')], components: [botconfigMenu()] });
+    }
+
+    // ---------------- ANTINUKE ----------------
+    case 'antinuke': {
+      if (!requireLevel(interaction, gconf, LEVEL.EXTRA_OWNER)) return safeReply(interaction, { embeds: [errorEmbed('Requires Extra Owner or higher.')], ephemeral: true });
+      const group = interaction.options.getSubcommandGroup(false);
+      const sub = interaction.options.getSubcommand();
+      if (group === 'whitelist') {
+        if (sub === 'add') {
+          const user = interaction.options.getUser('user');
+          if (!gconf.antinuke.whitelist.includes(user.id)) gconf.antinuke.whitelist.push(user.id);
+          saveDB();
+          return safeReply(interaction, { embeds: [successEmbed(`${user} added to anti-nuke whitelist.`)] });
+        }
+        if (sub === 'remove') {
+          const user = interaction.options.getUser('user');
+          gconf.antinuke.whitelist = gconf.antinuke.whitelist.filter(id => id !== user.id);
+          saveDB();
+          return safeReply(interaction, { embeds: [successEmbed(`${user} removed from anti-nuke whitelist.`)] });
+        }
+        if (sub === 'list') {
+          return safeReply(interaction, { embeds: [infoEmbed(gconf.antinuke.whitelist.length ? gconf.antinuke.whitelist.map(id => `<@${id}>`).join('\n') : 'Whitelist is empty.', 'Anti-Nuke Whitelist')] });
+        }
+      }
+      if (sub === 'enable') { gconf.antinuke.enabled = true; saveDB(); return safeReply(interaction, { embeds: [successEmbed('Anti-nuke enabled.')] }); }
+      if (sub === 'disable') { gconf.antinuke.enabled = false; saveDB(); return safeReply(interaction, { embeds: [successEmbed('Anti-nuke disabled.')] }); }
+      if (sub === 'config') {
+        const setting = interaction.options.getString('setting');
+        const value = interaction.options.getString('value');
+        if (!setting) {
+          const logChText = gconf.antinuke.logChannel ? `<#${gconf.antinuke.logChannel}>` : 'not set';
+          const bodyText = '```json\n' + JSON.stringify(gconf.antinuke.thresholds, null, 2) + '\n```\nwindowMs: ' + gconf.antinuke.windowMs + '\nlogChannel: ' + logChText;
+          return safeReply(interaction, { embeds: [infoEmbed(bodyText, 'Anti-Nuke Config')] });
+        }
+        if (setting === 'logChannel') {
+          const ch = interaction.options.getString('value')?.replace(/[<#>]/g, '');
+          gconf.antinuke.logChannel = ch;
+        } else if (setting === 'windowMs') {
+          gconf.antinuke.windowMs = parseInt(value, 10) || gconf.antinuke.windowMs;
+        } else {
+          gconf.antinuke.thresholds[setting] = parseInt(value, 10) || gconf.antinuke.thresholds[setting];
+        }
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`Updated \`${setting}\`.`)] });
+      }
+      if (sub === 'logs') {
+        const logs = gconf.antinuke.logs.slice(0, 10);
+        const desc = logs.length ? logs.map(l => `**${l.action}** by <@${l.executorId}> — ${l.punished ? 'punished' : 'not punished'} — <t:${Math.floor(l.ts / 1000)}:R>`).join('\n') : 'No events logged yet.';
+        return safeReply(interaction, { embeds: [infoEmbed(desc, '🛡️ Anti-Nuke Logs')] });
+      }
+      break;
+    }
+
+    // ---------------- ANTISPAM ----------------
+    case 'antispam': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'enable') { gconf.antispam.enabled = true; saveDB(); return safeReply(interaction, { embeds: [successEmbed('Anti-spam enabled.')] }); }
+      if (sub === 'disable') { gconf.antispam.enabled = false; saveDB(); return safeReply(interaction, { embeds: [successEmbed('Anti-spam disabled.')] }); }
+      if (sub === 'config') {
+        const setting = interaction.options.getString('setting');
+        const value = interaction.options.getString('value');
+        if (setting === 'logChannel') {
+          gconf.antispam.logChannel = value.replace(/[<#>]/g, '');
+        } else if (setting === 'blockInvites') {
+          gconf.antispam.blockInvites = value.toLowerCase() === 'true';
+        } else {
+          const n = parseInt(value, 10);
+          if (Number.isNaN(n)) return safeReply(interaction, { embeds: [errorEmbed('Value must be a number for this setting.')], ephemeral: true });
+          gconf.antispam[setting] = n;
+        }
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`Updated \`${setting}\` to \`${value}\`.`)] });
+      }
+      break;
+    }
+
+    // ---------------- BADWORDS ----------------
+    case 'badwords': {
+      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'add') {
+        const word = interaction.options.getString('word').toLowerCase();
+        if (!gconf.badwords.includes(word)) gconf.badwords.push(word);
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed('Word added to the filter.')], ephemeral: true });
+      }
+      if (sub === 'remove') {
+        const word = interaction.options.getString('word').toLowerCase();
+        gconf.badwords = gconf.badwords.filter(w => w !== word);
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed('Word removed from the filter.')], ephemeral: true });
+      }
+      if (sub === 'list') {
+        try {
+          await interaction.user.send({ embeds: [infoEmbed(gconf.badwords.length ? gconf.badwords.join(', ') : 'No words configured.', 'Bad Word List')] });
+          return safeReply(interaction, { embeds: [successEmbed('Sent you a DM with the list.')], ephemeral: true });
+        } catch {
+          return safeReply(interaction, { embeds: [errorEmbed('I could not DM you the list. Enable DMs from server members.')], ephemeral: true });
+        }
+      }
+      break;
+    }
+
+    // ---------------- MODERATION ----------------
+    case 'ban': case 'kick': case 'timeout': case 'warn': {
+      const targetUser = interaction.options.getUser('user');
+      const reason = interaction.options.getString('reason') || 'No reason provided';
+      if (targetUser.id === interaction.user.id) return safeReply(interaction, { embeds: [errorEmbed('You cannot target yourself.')], ephemeral: true });
+      if (isProtected(guild, gconf, targetUser.id)) return safeReply(interaction, { embeds: [warnEmbed('This user is protected and cannot be moderated.')], ephemeral: true });
+
+      const targetMember = await guild.members.fetch(targetUser.id).catch(() => null);
+
+      const permMap = { ban: PermissionFlagsBits.BanMembers, kick: PermissionFlagsBits.KickMembers, timeout: PermissionFlagsBits.ModerateMembers, warn: PermissionFlagsBits.ModerateMembers };
+      if (!interaction.member.permissions.has(permMap[commandName]) && !requireLevel(interaction, gconf, LEVEL.MOD)) {
+        return safeReply(interaction, { embeds: [errorEmbed('You lack permission to use this command.')], ephemeral: true });
+      }
+
+      if (targetMember) {
+        if (!actorOutranks(interaction.member, targetMember, guild) && interaction.member.id !== guild.ownerId) {
+          return safeReply(interaction, { embeds: [errorEmbed('You cannot moderate someone with an equal or higher role.')], ephemeral: true });
+        }
+        if (commandName !== 'warn' && !botCanActOn(guild, targetMember)) {
+          return safeReply(interaction, { embeds: [errorEmbed("I don't have a high enough role to do that.")], ephemeral: true });
+        }
+      }
+
+      if (commandName === 'warn') {
+        if (!gconf.warnings[targetUser.id]) gconf.warnings[targetUser.id] = [];
+        gconf.warnings[targetUser.id].push({ reason, mod: interaction.user.id, ts: Date.now() });
+        saveDB();
+        await tryDM(targetUser, warnEmbed(`You were warned in **${guild.name}**: ${reason}`));
+        const embed = successEmbed(`${targetUser} has been warned.\nReason: ${reason}`, 'Member Warned');
+        await logEvent(guild, gconf, embed);
+        return safeReply(interaction, { embeds: [embed] });
+      }
+
+      if (commandName === 'timeout') {
+        const durMs = parseDuration(interaction.options.getString('duration'));
+        if (!durMs || durMs > 28 * 86400000) return safeReply(interaction, { embeds: [errorEmbed('Invalid duration. Use formats like 10m, 1h, 1d (max 28d).')], ephemeral: true });
+        if (!targetMember) return safeReply(interaction, { embeds: [errorEmbed('That user is not in this server.')], ephemeral: true });
+        await targetMember.timeout(durMs, reason).catch(e => { throw e; });
+        await tryDM(targetUser, warnEmbed(`You were timed out in **${guild.name}** for ${interaction.options.getString('duration')}: ${reason}`));
+        const embed = successEmbed(`${targetUser} has been timed out for ${interaction.options.getString('duration')}.\nReason: ${reason}`, 'Member Timed Out');
+        await logEvent(guild, gconf, embed);
+        return safeReply(interaction, { embeds: [embed] });
+      }
+
+      if (commandName === 'kick') {
+        if (!targetMember) return safeReply(interaction, { embeds: [errorEmbed('That user is not in this server.')], ephemeral: true });
+        await tryDM(targetUser, warnEmbed(`You were kicked from **${guild.name}**: ${reason}`));
+        await targetMember.kick(reason);
+        const embed = successEmbed(`${targetUser} has been kicked.\nReason: ${reason}`, 'Member Kicked');
+        await logEvent(guild, gconf, embed);
+        return safeReply(interaction, { embeds: [embed] });
+      }
+
+      if (commandName === 'ban') {
+        await tryDM(targetUser, warnEmbed(`You were banned from **${guild.name}**: ${reason}`));
+        await guild.members.ban(targetUser.id, { reason });
+        const embed = successEmbed(`${targetUser} has been banned.\nReason: ${reason}`, 'Member Banned');
+        await logEvent(guild, gconf, embed);
+        return safeReply(interaction, { embeds: [embed] });
+      }
+      break;
+    }
+
+    case 'warnings': {
+      const user = interaction.options.getUser('user');
+      const list = gconf.warnings[user.id] || [];
+      const desc = list.length ? list.map((w, i) => `**${i + 1}.** ${w.reason} — <@${w.mod === 'AutoMod' ? client.user.id : w.mod}> — <t:${Math.floor(w.ts / 1000)}:R>`).join('\n') : 'No warnings on record.';
+      return safeReply(interaction, { embeds: [infoEmbed(desc, `Warnings — ${user.tag}`)] });
+    }
+    case 'clearwarns': {
+      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], ephemeral: true });
+      const user = interaction.options.getUser('user');
+      gconf.warnings[user.id] = [];
+      saveDB();
+      return safeReply(interaction, { embeds: [successEmbed(`Cleared warnings for ${user}.`)] });
+    }
+    case 'purge': {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Messages permission.')], ephemeral: true });
+      const amount = interaction.options.getInteger('amount');
+      await interaction.deferReply({ ephemeral: true });
+      const deleted = await interaction.channel.bulkDelete(amount, true).catch(() => null);
+      if (!deleted) return safeReply(interaction, { embeds: [errorEmbed('Could not delete messages (they may be older than 14 days).')] });
+      const embed = successEmbed(`Deleted ${deleted.size} messages in ${interaction.channel}.`, 'Purge');
+      await logEvent(guild, gconf, embed);
+      return safeReply(interaction, { embeds: [embed] });
+    }
+    case 'lock': {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
+      await interaction.channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false });
+      return safeReply(interaction, { embeds: [successEmbed('Channel locked.')] });
+    }
+    case 'unlock': {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
+      await interaction.channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: null });
+      return safeReply(interaction, { embeds: [successEmbed('Channel unlocked.')] });
+    }
+    case 'slowmode': {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
+      const secs = interaction.options.getInteger('seconds');
+      await interaction.channel.setRateLimitPerUser(secs);
+      return safeReply(interaction, { embeds: [successEmbed(`Slowmode set to ${secs}s.`)] });
+    }
+
+    // ---------------- TICKETS ----------------
+    case 'ticket': return handleTicketCommand(interaction, gconf);
+
+    // ---------------- WELCOME / GOODBYE ----------------
+    case 'welcome': case 'goodbye': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const conf = gconf[commandName];
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'setup') {
+        const channel = interaction.options.getChannel('channel');
+        const message = interaction.options.getString('message');
+        conf.enabled = true; conf.channelId = channel.id;
+        if (message) conf.message = message;
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`${commandName} messages configured in ${channel}.`)] });
+      }
+      if (sub === 'test') {
+        if (!conf.channelId) return safeReply(interaction, { embeds: [errorEmbed(`Run \`/${commandName} setup\` first.`)], ephemeral: true });
+        const ch = await guild.channels.fetch(conf.channelId).catch(() => null);
+        const text = replaceVars(conf.message, { user: interaction.user, guild });
+        if (ch) ch.send({ embeds: [new EmbedBuilder().setColor(commandName === 'welcome' ? COLORS.success : COLORS.error).setDescription(text)] });
+        return safeReply(interaction, { embeds: [successEmbed('Test message sent.')], ephemeral: true });
+      }
+      if (sub === 'disable') {
+        conf.enabled = false; saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`${commandName} messages disabled.`)] });
+      }
+      break;
+    }
+
+    // ---------------- DM SYSTEM ----------------
+    case 'dm': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      const message = interaction.options.getString('message');
+      await interaction.deferReply({ ephemeral: true });
+      const embed = infoEmbed(message, `Message from ${guild.name}`);
+      if (sub === 'user') {
+        const user = interaction.options.getUser('user');
+        const ok = await tryDM(user, embed);
+        gconf.dmlogs.unshift({ type: 'user', target: user.id, ok, ts: Date.now() }); gconf.dmlogs = gconf.dmlogs.slice(0, 200); saveDB();
+        return safeReply(interaction, { embeds: [ok ? successEmbed(`DM sent to ${user}.`) : errorEmbed(`Could not DM ${user} (DMs closed).`)] });
+      }
+      if (sub === 'role') {
+        const role = interaction.options.getRole('role');
+        await guild.members.fetch();
+        const members = role.members;
+        let sent = 0, failed = 0;
+        for (const [, m] of members) {
+          const ok = await tryDM(m.user, embed);
+          if (ok) sent++; else failed++;
+          await new Promise(r => setTimeout(r, 800)); // rate-limit friendly
+        }
+        gconf.dmlogs.unshift({ type: 'role', target: role.id, sent, failed, ts: Date.now() }); gconf.dmlogs = gconf.dmlogs.slice(0, 200); saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`Sent to ${sent} member(s), failed for ${failed}.`)] });
+      }
+      if (sub === 'everyone') {
+        await guild.members.fetch();
+        const members = guild.members.cache.filter(m => !m.user.bot);
+        let sent = 0, failed = 0;
+        for (const [, m] of members) {
+          const ok = await tryDM(m.user, embed);
+          if (ok) sent++; else failed++;
+          await new Promise(r => setTimeout(r, 1000));
+        }
+        gconf.dmlogs.unshift({ type: 'everyone', sent, failed, ts: Date.now() }); gconf.dmlogs = gconf.dmlogs.slice(0, 200); saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`Sent to ${sent} member(s), failed for ${failed}.`)] });
+      }
+      break;
+    }
+    case 'dmlogs': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const logs = gconf.dmlogs.slice(0, 10);
+      const desc = logs.length ? logs.map(l => `**${l.type}** ${l.target ? `→ <@${l.target}>` : ''} ${l.sent !== undefined ? `(${l.sent} sent / ${l.failed} failed)` : (l.ok ? '✅' : '❌')} — <t:${Math.floor(l.ts / 1000)}:R>`).join('\n') : 'No DM activity logged yet.';
+      return safeReply(interaction, { embeds: [infoEmbed(desc, 'DM Logs')] });
+    }
+
+    // ---------------- INVITES ----------------
+    case 'invites': {
+      const user = interaction.options.getUser('user') || interaction.user;
+      const count = gconf.invites.leaders[user.id] || 0;
+      return safeReply(interaction, { embeds: [infoEmbed(`${user} has **${count}** invite(s).`, 'Invite Stats')] });
+    }
+    case 'inviteleaderboard': {
+      const entries = Object.entries(gconf.invites.leaders).sort((a, b) => b[1] - a[1]).slice(0, 10);
+      const desc = entries.length ? entries.map(([id, n], i) => `**${i + 1}.** <@${id}> — ${n} invite(s)`).join('\n') : 'No invite data yet.';
+      return safeReply(interaction, { embeds: [infoEmbed(desc, '🏆 Invite Leaderboard')] });
+    }
+    case 'resetinvites': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      gconf.invites = { cache: {}, joins: {}, leaders: {} };
+      saveDB();
+      return safeReply(interaction, { embeds: [successEmbed('Invite statistics reset.')] });
+    }
+
+    // ---------------- CUSTOM COMMANDS ----------------
+    case 'customcommand': {
+      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'add') {
+        const name = interaction.options.getString('name').toLowerCase();
+        const response = interaction.options.getString('response');
+        gconf.customcommands[name] = response;
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`Custom command \`!${name}\` added.`)] });
+      }
+      if (sub === 'remove') {
+        const name = interaction.options.getString('name').toLowerCase();
+        delete gconf.customcommands[name];
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`Custom command \`!${name}\` removed.`)] });
+      }
+      if (sub === 'list') {
+        const names = Object.keys(gconf.customcommands);
+        return safeReply(interaction, { embeds: [infoEmbed(names.length ? names.map(n => `\`!${n}\``).join(', ') : 'No custom commands set.', 'Custom Commands')] });
+      }
+      break;
+    }
+
+    // ---------------- GIVEAWAY ----------------
+    case 'giveaway': {
+      if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'start') {
+        const prize = interaction.options.getString('prize');
+        const durMs = parseDuration(interaction.options.getString('duration'));
+        const winners = interaction.options.getInteger('winners');
+        if (!durMs) return safeReply(interaction, { embeds: [errorEmbed('Invalid duration format. Use e.g. 10m, 1h, 1d.')], ephemeral: true });
+        const endsAt = Date.now() + durMs;
+        const embed = new EmbedBuilder().setColor(COLORS.info).setTitle('🎉 Giveaway!')
+          .setDescription(`Prize: **${prize}**\nWinners: **${winners}**\nEnds: <t:${Math.floor(endsAt / 1000)}:R>\n\nClick the button below to enter!`)
+          .setTimestamp();
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('giveaway_enter').setLabel('🎉 Enter').setStyle(ButtonStyle.Primary));
+        await interaction.reply({ embeds: [embed], components: [row] });
+        const msg = await interaction.fetchReply();
+        gconf.giveaways[msg.id] = { channelId: interaction.channel.id, prize, winners, endsAt, entrants: [], ended: false };
+        saveDB();
+        return;
+      }
+      if (sub === 'end') {
+        const id = interaction.options.getString('messageid');
+        if (!gconf.giveaways[id]) return safeReply(interaction, { embeds: [errorEmbed('No giveaway found with that message ID.')], ephemeral: true });
+        await endGiveaway(guild, id, gconf);
+        return safeReply(interaction, { embeds: [successEmbed('Giveaway ended.')], ephemeral: true });
+      }
+      if (sub === 'reroll') {
+        const id = interaction.options.getString('messageid');
+        const g = gconf.giveaways[id];
+        if (!g) return safeReply(interaction, { embeds: [errorEmbed('No giveaway found with that message ID.')], ephemeral: true });
+        if (!g.entrants.length) return safeReply(interaction, { embeds: [errorEmbed('No entrants to reroll from.')], ephemeral: true });
+        const winner = g.entrants[Math.floor(Math.random() * g.entrants.length)];
+        const ch = await guild.channels.fetch(g.channelId).catch(() => null);
+        if (ch) ch.send({ embeds: [successEmbed(`New winner for **${g.prize}**: <@${winner}>`, '🎉 Reroll')] });
+        return safeReply(interaction, { embeds: [successEmbed('Rerolled.')], ephemeral: true });
+      }
+      break;
+    }
+
+    // ---------------- STATUS MONITOR ----------------
+    case 'statusmonitor': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'add') {
+        const url = interaction.options.getString('url');
+        if (!/^https?:\/\//i.test(url)) return safeReply(interaction, { embeds: [errorEmbed('URL must start with http:// or https://')], ephemeral: true });
+        const channel = interaction.options.getChannel('channel');
+        gconf.statusmonitors.push({ url, channelId: channel.id, lastStatus: null });
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`Now monitoring ${url}.`)] });
+      }
+      if (sub === 'remove') {
+        const url = interaction.options.getString('url');
+        gconf.statusmonitors = gconf.statusmonitors.filter(m => m.url !== url);
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed('Removed from monitoring.')] });
+      }
+      if (sub === 'list') {
+        const desc = gconf.statusmonitors.length ? gconf.statusmonitors.map(m => `${m.url} — ${m.lastStatus || 'unknown'}`).join('\n') : 'No URLs monitored.';
+        return safeReply(interaction, { embeds: [infoEmbed(desc, 'Status Monitors')] });
+      }
+      break;
+    }
+
+    // ---------------- WEATHER ----------------
+    case 'weather': {
+      await interaction.deferReply();
+      const location = interaction.options.getString('location');
+      try {
+        const geo = await fetch(`https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(location)}&count=1`).then(r => r.json());
+        if (!geo.results || !geo.results.length) return safeReply(interaction, { embeds: [errorEmbed('Location not found.')] });
+        const { latitude, longitude, name, country } = geo.results[0];
+        const weather = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latitude}&longitude=${longitude}&current_weather=true`).then(r => r.json());
+        const cw = weather.current_weather;
+        const embed = infoEmbed(`Temperature: **${cw.temperature}°C**\nWind: **${cw.windspeed} km/h**\nCode: ${cw.weathercode}`, `🌤️ Weather in ${name}, ${country}`);
+        return safeReply(interaction, { embeds: [embed] });
+      } catch (e) {
+        return safeReply(interaction, { embeds: [errorEmbed('Could not fetch weather right now.')] });
+      }
+    }
+
+    // ---------------- QR CODE ----------------
+    case 'qrcode': {
+      await interaction.deferReply();
+      const text = interaction.options.getString('text');
+      const url = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(text)}`;
+      return safeReply(interaction, { embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle('QR Code').setImage(url)] });
+    }
+
+    // ---------------- REMINDME ----------------
+    case 'remindme': {
+      const durMs = parseDuration(interaction.options.getString('when'));
+      if (!durMs) return safeReply(interaction, { embeds: [errorEmbed('Invalid time format. Use e.g. 10m, 1h, 2d.')], ephemeral: true });
+      const text = interaction.options.getString('text');
+      gconf.reminders.push({ userId: interaction.user.id, channelId: interaction.channel.id, remindAt: Date.now() + durMs, text, id: Date.now().toString() });
+      saveDB();
+      return safeReply(interaction, { embeds: [successEmbed(`I'll remind you in ${interaction.options.getString('when')}.`)], ephemeral: true });
+    }
+
+    // ---------------- POLL ----------------
+    case 'poll': {
+      const question = interaction.options.getString('question');
+      const optionsStr = interaction.options.getString('options');
+      if (optionsStr) {
+        const opts = optionsStr.split(',').map(s => s.trim()).filter(Boolean).slice(0, 5);
+        const emojis = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
+        const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(`📊 ${question}`)
+          .setDescription(opts.map((o, i) => `${emojis[i]} ${o}`).join('\n')).setTimestamp();
+        await interaction.reply({ embeds: [embed] });
+        const msg = await interaction.fetchReply();
+        for (let i = 0; i < opts.length; i++) await msg.react(emojis[i]).catch(() => {});
+        return;
+      }
+      const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(`📊 ${question}`).setTimestamp();
+      await interaction.reply({ embeds: [embed] });
+      const msg = await interaction.fetchReply();
+      await msg.react('👍').catch(() => {});
+      await msg.react('👎').catch(() => {});
+      return;
+    }
+
+    // ---------------- AFK ----------------
+    case 'afk': {
+      const reason = interaction.options.getString('reason') || 'AFK';
+      gconf.afk[interaction.user.id] = { reason, since: Date.now() };
+      saveDB();
+      return safeReply(interaction, { embeds: [successEmbed(`You are now AFK: ${reason}`)] });
+    }
+
+    // ---------------- INFO COMMANDS ----------------
+    case 'serverinfo': {
+      const owner = await guild.fetchOwner().catch(() => null);
+      const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(guild.name).setThumbnail(guild.iconURL())
+        .addFields(
+          { name: 'Server ID', value: guild.id, inline: true },
+          { name: 'Owner', value: owner ? `${owner.user.tag}` : 'Unknown', inline: true },
+          { name: 'Members', value: `${guild.memberCount}`, inline: true },
+          { name: 'Channels', value: `${guild.channels.cache.size}`, inline: true },
+          { name: 'Roles', value: `${guild.roles.cache.size}`, inline: true },
+          { name: 'Boosts', value: `${guild.premiumSubscriptionCount || 0} (Level ${guild.premiumTier})`, inline: true },
+          { name: 'Created', value: `<t:${Math.floor(guild.createdTimestamp / 1000)}:D>`, inline: true },
+        ).setTimestamp();
+      return safeReply(interaction, { embeds: [embed] });
+    }
+    case 'userinfo': {
+      const user = interaction.options.getUser('user') || interaction.user;
+      const member = await guild.members.fetch(user.id).catch(() => null);
+      const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(user.tag).setThumbnail(user.displayAvatarURL())
+        .addFields(
+          { name: 'ID', value: user.id, inline: true },
+          { name: 'Account Created', value: `<t:${Math.floor(user.createdTimestamp / 1000)}:D>`, inline: true },
+          { name: 'Joined Server', value: member ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:D>` : 'N/A', inline: true },
+          { name: 'Roles', value: member ? (member.roles.cache.filter(r => r.id !== guild.id).map(r => `<@&${r.id}>`).join(', ') || 'None') : 'N/A' },
+        ).setTimestamp();
+      return safeReply(interaction, { embeds: [embed] });
+    }
+    case 'roleinfo': {
+      const role = interaction.options.getRole('role');
+      const embed = new EmbedBuilder().setColor(role.color || COLORS.info).setTitle(`Role: ${role.name}`)
+        .addFields(
+          { name: 'ID', value: role.id, inline: true },
+          { name: 'Position', value: `${role.position}`, inline: true },
+          { name: 'Color', value: role.hexColor, inline: true },
+          { name: 'Members', value: `${role.members.size}`, inline: true },
+          { name: 'Key Permissions', value: role.permissions.toArray().slice(0, 10).join(', ') || 'None' },
+        ).setTimestamp();
+      return safeReply(interaction, { embeds: [embed] });
+    }
+    case 'avatar': {
+      const user = interaction.options.getUser('user') || interaction.user;
+      return safeReply(interaction, { embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle(`${user.tag}'s Avatar`).setImage(user.displayAvatarURL({ size: 512 }))] });
+    }
+    case 'banner': {
+      const user = await client.users.fetch((interaction.options.getUser('user') || interaction.user).id, { force: true });
+      if (!user.bannerURL()) return safeReply(interaction, { embeds: [errorEmbed('This user has no banner set.')], ephemeral: true });
+      return safeReply(interaction, { embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle(`${user.tag}'s Banner`).setImage(user.bannerURL({ size: 512 }))] });
+    }
+    case 'membercount': {
+      const bots = guild.members.cache.filter(m => m.user.bot).size;
+      return safeReply(interaction, { embeds: [infoEmbed(`Total: **${guild.memberCount}**\nHumans: **${guild.memberCount - bots}**\nBots: **${bots}**`, 'Member Count')] });
+    }
+    case 'ping': {
+      const sent = await interaction.reply({ embeds: [infoEmbed('Pinging...')], fetchReply: true });
+      const rtt = sent.createdTimestamp - interaction.createdTimestamp;
+      return interaction.editReply({ embeds: [infoEmbed(`Bot latency: **${rtt}ms**\nAPI latency: **${Math.round(client.ws.ping)}ms**`, '🏓 Pong!')] });
+    }
+    case 'stats': {
+      const uptime = Math.floor((Date.now() - startTime) / 1000);
+      const mem = process.memoryUsage().heapUsed / 1024 / 1024;
+      const embed = infoEmbed(
+        `Uptime: <t:${Math.floor(startTime / 1000)}:R>\nMemory: **${mem.toFixed(1)} MB**\nServers: **${client.guilds.cache.size}**\nUsers: **${client.guilds.cache.reduce((a, g) => a + g.memberCount, 0)}**\nChannels: **${client.channels.cache.size}**\nCommands: **${commands.length}**`,
+        '📊 Bot Statistics',
+      );
+      return safeReply(interaction, { embeds: [embed] });
+    }
+    case 'help': {
+      const pages = buildHelpPages();
+      return safeReply(interaction, { embeds: [pages[0]], components: [helpButtons(0)] });
+    }
+
+    // ---------------- SERVER MANAGEMENT ----------------
+    case 'autorole': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'set') {
+        const role = interaction.options.getRole('role');
+        gconf.autorole.roleId = role.id; saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`Autorole set to ${role}.`)] });
+      }
+      gconf.autorole.roleId = null; saveDB();
+      return safeReply(interaction, { embeds: [successEmbed('Autorole removed.')] });
+    }
+    case 'stickyroles': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      gconf.stickyroles.enabled = sub === 'enable'; saveDB();
+      return safeReply(interaction, { embeds: [successEmbed(`Sticky roles ${sub}d.`)] });
+    }
+    case 'addrole': case 'removerole': {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageRoles)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Roles permission.')], ephemeral: true });
+      const user = interaction.options.getUser('user');
+      const role = interaction.options.getRole('role');
+      const member = await guild.members.fetch(user.id).catch(() => null);
+      if (!member) return safeReply(interaction, { embeds: [errorEmbed('User not found in this server.')], ephemeral: true });
+      if (role.position >= guild.members.me.roles.highest.position) return safeReply(interaction, { embeds: [errorEmbed("I can't manage a role positioned above or equal to my highest role.")], ephemeral: true });
+      if (commandName === 'addrole') await member.roles.add(role).catch(() => {});
+      else await member.roles.remove(role).catch(() => {});
+      return safeReply(interaction, { embeds: [successEmbed(`${role} ${commandName === 'addrole' ? 'added to' : 'removed from'} ${user}.`)] });
+    }
+    case 'verifyconfig': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const role = interaction.options.getRole('role');
+      const channel = interaction.options.getChannel('channel');
+      gconf.verification.enabled = true;
+      gconf.verification.roleId = role.id;
+      gconf.verification.channelId = channel.id;
+      saveDB();
+      return safeReply(interaction, { embeds: [successEmbed(`Verification configured. Run \`/verify\` to post the button in ${channel}.`)] });
+    }
+    case 'verify': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      if (!gconf.verification.enabled) return safeReply(interaction, { embeds: [errorEmbed('Run `/verifyconfig` first.')], ephemeral: true });
+      const ch = await guild.channels.fetch(gconf.verification.channelId).catch(() => null);
+      if (!ch) return safeReply(interaction, { embeds: [errorEmbed('Configured verification channel not found.')], ephemeral: true });
+      const embed = infoEmbed('Click the button below to verify yourself and gain access to the server.', '✅ Verification');
+      const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('verify_button').setLabel('Verify').setStyle(ButtonStyle.Success));
+      const msg = await ch.send({ embeds: [embed], components: [row] });
+      gconf.verification.messageId = msg.id; saveDB();
+      return safeReply(interaction, { embeds: [successEmbed('Verification panel posted.')], ephemeral: true });
+    }
+    case 'serverstats': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'setup') {
+        await interaction.deferReply({ ephemeral: true });
+        const cats = { members: 'Members: 0', bots: 'Bots: 0', humans: 'Humans: 0', online: 'Online: 0', boosts: 'Boosts: 0' };
+        for (const [key, name] of Object.entries(cats)) {
+          const ch = await guild.channels.create({ name, type: ChannelType.GuildVoice, permissionOverwrites: [{ id: guild.roles.everyone, deny: [PermissionFlagsBits.Connect] }] }).catch(() => null);
+          if (ch) gconf.serverstats.channels[key] = ch.id;
+        }
+        saveDB();
+        await serverStatsTick();
+        return safeReply(interaction, { embeds: [successEmbed('Server statistic channels created.')] });
+      }
+      for (const chId of Object.values(gconf.serverstats.channels)) {
+        const ch = await guild.channels.fetch(chId).catch(() => null);
+        if (ch) await ch.delete().catch(() => {});
+      }
+      gconf.serverstats.channels = {}; saveDB();
+      return safeReply(interaction, { embeds: [successEmbed('Server statistic channels removed.')] });
+    }
+
+    // ---------------- FUN & ENGAGEMENT ----------------
+    case 'starboard': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'setup') {
+        gconf.starboard.enabled = true;
+        gconf.starboard.channelId = interaction.options.getChannel('channel').id;
+        gconf.starboard.threshold = interaction.options.getInteger('threshold');
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed('Starboard configured.')] });
+      }
+      gconf.starboard.enabled = false; saveDB();
+      return safeReply(interaction, { embeds: [successEmbed('Starboard disabled.')] });
+    }
+    case 'reactionrole': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'add') {
+        const messageId = interaction.options.getString('messageid');
+        const emoji = interaction.options.getString('emoji');
+        const role = interaction.options.getRole('role');
+        gconf.reactionroles.push({ messageId, emoji, roleId: role.id });
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`Reaction role added: ${emoji} → ${role}. Make sure to react ${emoji} on that message yourself so users can see it, or ask users to react.`)] });
+      }
+      if (sub === 'remove') {
+        const messageId = interaction.options.getString('messageid');
+        const emoji = interaction.options.getString('emoji');
+        gconf.reactionroles = gconf.reactionroles.filter(r => !(r.messageId === messageId && r.emoji === emoji));
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed('Reaction role removed.')] });
+      }
+      const desc = gconf.reactionroles.length ? gconf.reactionroles.map(r => `${r.emoji} → <@&${r.roleId}> (msg: ${r.messageId})`).join('\n') : 'No reaction roles configured.';
+      return safeReply(interaction, { embeds: [infoEmbed(desc, 'Reaction Roles')] });
+    }
+    case 'autopublish': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      const channel = interaction.options.getChannel('channel');
+      if (sub === 'setup') {
+        if (!gconf.autopublish.channels.includes(channel.id)) gconf.autopublish.channels.push(channel.id);
+      } else {
+        gconf.autopublish.channels = gconf.autopublish.channels.filter(id => id !== channel.id);
+      }
+      saveDB();
+      return safeReply(interaction, { embeds: [successEmbed(`Auto-publish ${sub === 'setup' ? 'enabled' : 'disabled'} for ${channel}.`)] });
+    }
+
+    default:
+      return safeReply(interaction, { embeds: [errorEmbed('Unknown command.')], ephemeral: true });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TICKET SYSTEM COMMAND HANDLER
+// ---------------------------------------------------------------------------
+async function handleTicketCommand(interaction, gconf) {
+  const sub = interaction.options.getSubcommand();
+  const guild = interaction.guild;
+  const adminSubs = ['setup', 'panel', 'panels', 'editpanel', 'deletepanel', 'closeall', 'addtype', 'listtypes', 'edittype', 'deletetype', 'config'];
+
+  if (adminSubs.includes(sub) && !requireLevel(interaction, gconf, LEVEL.ADMIN)) {
+    return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+  }
+
+  if (sub === 'setup') {
+    gconf.tickets.categoryId = interaction.options.getChannel('category').id;
+    gconf.tickets.supportRoles = [interaction.options.getRole('supportrole').id];
+    const logch = interaction.options.getChannel('logchannel');
+    if (logch) gconf.tickets.logChannel = logch.id;
+    saveDB();
+    return safeReply(interaction, { embeds: [successEmbed('Ticket system configured.')] });
+  }
+  if (sub === 'panel') {
+    if (!gconf.tickets.categoryId) return safeReply(interaction, { embeds: [errorEmbed('Run `/ticket setup` first.')], ephemeral: true });
+    const title = interaction.options.getString('title');
+    const description = interaction.options.getString('description');
+    const types = Object.keys(gconf.tickets.types);
+    const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(title).setDescription(description).setTimestamp();
+    let row;
+    if (types.length) {
+      row = new ActionRowBuilder().addComponents(
+        new StringSelectMenuBuilder().setCustomId('ticket_create_select').setPlaceholder('Select a ticket type')
+          .addOptions(types.slice(0, 25).map(t => ({ label: t, value: t, emoji: gconf.tickets.types[t].emoji || undefined }))),
+      );
+    } else {
+      row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('ticket_create_default').setLabel('🎫 Open Ticket').setStyle(ButtonStyle.Primary));
+    }
+    const msg = await interaction.channel.send({ embeds: [embed], components: [row] });
+    const panelId = gconf.tickets.nextPanelId++;
+    gconf.tickets.panels[panelId] = { channelId: interaction.channel.id, messageId: msg.id, title, description };
+    saveDB();
+    return safeReply(interaction, { embeds: [successEmbed(`Panel #${panelId} posted.`)], ephemeral: true });
+  }
+  if (sub === 'panels') {
+    const entries = Object.entries(gconf.tickets.panels);
+    const desc = entries.length ? entries.map(([id, p]) => `**#${id}** — ${p.title} (<#${p.channelId}>)`).join('\n') : 'No panels created.';
+    return safeReply(interaction, { embeds: [infoEmbed(desc, 'Ticket Panels')] });
+  }
+  if (sub === 'editpanel') {
+    const id = interaction.options.getInteger('id');
+    const panel = gconf.tickets.panels[id];
+    if (!panel) return safeReply(interaction, { embeds: [errorEmbed('Panel not found.')], ephemeral: true });
+    const title = interaction.options.getString('title') || panel.title;
+    const description = interaction.options.getString('description') || panel.description;
+    panel.title = title; panel.description = description;
+    const ch = await guild.channels.fetch(panel.channelId).catch(() => null);
+    const msg = ch ? await ch.messages.fetch(panel.messageId).catch(() => null) : null;
+    if (msg) msg.edit({ embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle(title).setDescription(description)] }).catch(() => {});
+    saveDB();
+    return safeReply(interaction, { embeds: [successEmbed(`Panel #${id} updated.`)] });
+  }
+  if (sub === 'deletepanel') {
+    const id = interaction.options.getInteger('id');
+    const panel = gconf.tickets.panels[id];
+    if (!panel) return safeReply(interaction, { embeds: [errorEmbed('Panel not found.')], ephemeral: true });
+    const ch = await guild.channels.fetch(panel.channelId).catch(() => null);
+    if (ch) { const msg = await ch.messages.fetch(panel.messageId).catch(() => null); if (msg) msg.delete().catch(() => {}); }
+    delete gconf.tickets.panels[id]; saveDB();
+    return safeReply(interaction, { embeds: [successEmbed(`Panel #${id} deleted.`)] });
+  }
+  if (sub === 'closeall') {
+    await interaction.deferReply({ ephemeral: true });
+    let count = 0;
+    for (const chId of Object.keys(gconf.tickets.openTickets)) {
+      const ch = await guild.channels.fetch(chId).catch(() => null);
+      if (ch) { await ch.delete().catch(() => {}); count++; }
+      delete gconf.tickets.openTickets[chId];
+    }
+    gconf.tickets.closedCount += count;
+    saveDB();
+    return safeReply(interaction, { embeds: [successEmbed(`Closed ${count} ticket(s).`)] });
+  }
+  if (sub === 'addtype') {
+    const name = interaction.options.getString('name');
+    const emoji = interaction.options.getString('emoji') || '🎫';
+    gconf.tickets.types[name] = { label: name, emoji };
+    saveDB();
+    return safeReply(interaction, { embeds: [successEmbed(`Ticket type **${name}** added.`)] });
+  }
+  if (sub === 'listtypes') {
+    const entries = Object.entries(gconf.tickets.types);
+    return safeReply(interaction, { embeds: [infoEmbed(entries.length ? entries.map(([n, t]) => `${t.emoji} ${n}`).join('\n') : 'No ticket types configured.', 'Ticket Types')] });
+  }
+  if (sub === 'edittype') {
+    const name = interaction.options.getString('name');
+    if (!gconf.tickets.types[name]) return safeReply(interaction, { embeds: [errorEmbed('Type not found.')], ephemeral: true });
+    gconf.tickets.types[name].emoji = interaction.options.getString('emoji');
+    saveDB();
+    return safeReply(interaction, { embeds: [successEmbed(`Type **${name}** updated.`)] });
+  }
+  if (sub === 'deletetype') {
+    const name = interaction.options.getString('name');
+    delete gconf.tickets.types[name]; saveDB();
+    return safeReply(interaction, { embeds: [successEmbed(`Type **${name}** deleted.`)] });
+  }
+  if (sub === 'config') {
+    return safeReply(interaction, { embeds: [configSummaryEmbed(gconf, 'tickets')] });
+  }
+
+  // ---- ticket-channel-scoped subcommands ----
+  const ticketData = gconf.tickets.openTickets[interaction.channel.id];
+
+  if (sub === 'add' || sub === 'remove') {
+    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    const user = interaction.options.getUser('user');
+    if (sub === 'add') await interaction.channel.permissionOverwrites.edit(user.id, { ViewChannel: true, SendMessages: true });
+    else await interaction.channel.permissionOverwrites.delete(user.id);
+    return safeReply(interaction, { embeds: [successEmbed(`${user} ${sub === 'add' ? 'added to' : 'removed from'} the ticket.`)] });
+  }
+  if (sub === 'claim') {
+    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    ticketData.claimedBy = interaction.user.id; saveDB();
+    return safeReply(interaction, { embeds: [successEmbed(`Ticket claimed by ${interaction.user}.`)] });
+  }
+  if (sub === 'close') {
+    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    await safeReply(interaction, { embeds: [warnEmbed('Closing this ticket in 5 seconds...')] });
+    const logCh = gconf.tickets.logChannel ? await guild.channels.fetch(gconf.tickets.logChannel).catch(() => null) : null;
+    if (logCh) logCh.send({ embeds: [infoEmbed(`Ticket <#${interaction.channel.id}> closed by ${interaction.user}.`, '🎫 Ticket Closed')] }).catch(() => {});
+    delete gconf.tickets.openTickets[interaction.channel.id];
+    gconf.tickets.closedCount++;
+    saveDB();
+    setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
+    return;
+  }
+  if (sub === 'transcript') {
+    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    await interaction.deferReply();
+    const messages = await interaction.channel.messages.fetch({ limit: 100 });
+    const sorted = [...messages.values()].reverse();
+    const lines = sorted.map(m => `[${m.createdAt.toISOString()}] ${m.author.tag}: ${m.content}${m.attachments.size ? ' ' + [...m.attachments.values()].map(a => a.url).join(' ') : ''}`);
+    const buffer = Buffer.from(lines.join('\n'), 'utf8');
+    const attachment = new AttachmentBuilder(buffer, { name: `transcript-${interaction.channel.id}.txt` });
+    return safeReply(interaction, { content: 'Transcript generated:', files: [attachment] });
+  }
+  if (sub === 'stats') {
+    const open = Object.keys(gconf.tickets.openTickets).length;
+    return safeReply(interaction, { embeds: [infoEmbed(`Open tickets: **${open}**\nTotal closed: **${gconf.tickets.closedCount}**`, '🎫 Ticket Stats')] });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TICKET CREATION HELPER (shared by button + select menu)
+// ---------------------------------------------------------------------------
+async function createTicket(interaction, gconf, type = 'general') {
+  const guild = interaction.guild;
+  if (!gconf.tickets.categoryId) return safeReply(interaction, { embeds: [errorEmbed('Ticket system is not configured yet.')], ephemeral: true });
+
+  const userCount = gconf.tickets.userTicketCount[interaction.user.id] || 0;
+  const openForUser = Object.values(gconf.tickets.openTickets).filter(t => t.userId === interaction.user.id).length;
+  if (openForUser >= 3) return safeReply(interaction, { embeds: [errorEmbed('You already have the maximum number of open tickets (3).')], ephemeral: true });
+
+  const overwrites = [
+    { id: guild.roles.everyone, deny: [PermissionFlagsBits.ViewChannel] },
+    { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
+    { id: guild.members.me.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ManageChannels] },
+  ];
+  for (const roleId of gconf.tickets.supportRoles) {
+    overwrites.push({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+  }
+
+  const channel = await guild.channels.create({
+    name: `ticket-${interaction.user.username}`.slice(0, 90),
+    type: ChannelType.GuildText,
+    parent: gconf.tickets.categoryId,
+    permissionOverwrites: overwrites,
+  }).catch(() => null);
+
+  if (!channel) return safeReply(interaction, { embeds: [errorEmbed('Failed to create ticket channel (check my permissions/category).')], ephemeral: true });
+
+  gconf.tickets.openTickets[channel.id] = { userId: interaction.user.id, type, claimedBy: null, createdAt: Date.now() };
+  gconf.tickets.userTicketCount[interaction.user.id] = userCount + 1;
+  saveDB();
+
+  const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(`🎫 Ticket — ${type}`)
+    .setDescription(`Welcome ${interaction.user}, support will be with you shortly.\nUse the buttons below to manage this ticket.`).setTimestamp();
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId('ticket_claim').setLabel('Claim').setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId('ticket_close').setLabel('Close').setStyle(ButtonStyle.Danger),
+  );
+  await channel.send({ content: gconf.tickets.supportRoles.map(r => `<@&${r}>`).join(' '), embeds: [embed], components: [row] });
+
+  const logCh = gconf.tickets.logChannel ? await guild.channels.fetch(gconf.tickets.logChannel).catch(() => null) : null;
+  if (logCh) logCh.send({ embeds: [infoEmbed(`New ticket <#${channel.id}> opened by ${interaction.user} (${type}).`, '🎫 Ticket Opened')] }).catch(() => {});
+
+  return safeReply(interaction, { embeds: [successEmbed(`Ticket created: ${channel}`)], ephemeral: true });
+}
+
+// ---------------------------------------------------------------------------
+// BUTTON HANDLER
+// ---------------------------------------------------------------------------
+async function handleButton(interaction) {
+  const gconf = getGuild(interaction.guild.id);
+  const id = interaction.customId;
+
+  if (id === 'help_prev' || id === 'help_next') {
+    const pages = buildHelpPages();
+    const page = id === 'help_next' ? 1 : 0;
+    return interaction.update({ embeds: [pages[page]], components: [helpButtons(page)] });
+  }
+
+  if (id === 'ticket_create_default') return createTicket(interaction, gconf, 'general');
+
+  if (id === 'ticket_claim') {
+    const ticketData = gconf.tickets.openTickets[interaction.channel.id];
+    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    ticketData.claimedBy = interaction.user.id; saveDB();
+    return safeReply(interaction, { embeds: [successEmbed(`Claimed by ${interaction.user}.`)] });
+  }
+  if (id === 'ticket_close') {
+    const ticketData = gconf.tickets.openTickets[interaction.channel.id];
+    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    await safeReply(interaction, { embeds: [warnEmbed('Closing this ticket in 5 seconds...')] });
+    const logCh = gconf.tickets.logChannel ? await interaction.guild.channels.fetch(gconf.tickets.logChannel).catch(() => null) : null;
+    if (logCh) logCh.send({ embeds: [infoEmbed(`Ticket <#${interaction.channel.id}> closed by ${interaction.user}.`, '🎫 Ticket Closed')] }).catch(() => {});
+    delete gconf.tickets.openTickets[interaction.channel.id];
+    gconf.tickets.closedCount++;
+    saveDB();
+    setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
+    return;
+  }
+
+  if (id === 'verify_button') {
+    if (!gconf.verification.enabled) return safeReply(interaction, { embeds: [errorEmbed('Verification is not configured.')], ephemeral: true });
+    const role = interaction.guild.roles.cache.get(gconf.verification.roleId);
+    if (!role) return safeReply(interaction, { embeds: [errorEmbed('Configured role not found.')], ephemeral: true });
+    await interaction.member.roles.add(role).catch(() => {});
+    return safeReply(interaction, { embeds: [successEmbed('You are now verified!')], ephemeral: true });
+  }
+
+  if (id === 'giveaway_enter') {
+    const g = gconf.giveaways[interaction.message.id];
+    if (!g || g.ended) return safeReply(interaction, { embeds: [errorEmbed('This giveaway has ended.')], ephemeral: true });
+    if (g.entrants.includes(interaction.user.id)) {
+      g.entrants = g.entrants.filter(id2 => id2 !== interaction.user.id);
+      saveDB();
+      return safeReply(interaction, { embeds: [infoEmbed('You left the giveaway.')], ephemeral: true });
+    }
+    g.entrants.push(interaction.user.id);
+    saveDB();
+    return safeReply(interaction, { embeds: [successEmbed('You entered the giveaway! Click again to leave.')], ephemeral: true });
+  }
+
+  if (id.startsWith('botconfig_')) return; // handled in select
+}
+
+// ---------------------------------------------------------------------------
+// SELECT MENU HANDLER
+// ---------------------------------------------------------------------------
+async function handleSelect(interaction) {
+  const gconf = getGuild(interaction.guild.id);
+  if (interaction.customId === 'botconfig_select') {
+    const section = interaction.values[0];
+    return interaction.update({ embeds: [configSummaryEmbed(gconf, section)], components: [botconfigMenu()] });
+  }
+  if (interaction.customId === 'ticket_create_select') {
+    const type = interaction.values[0];
+    return createTicket(interaction, gconf, type);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MODAL HANDLER (reserved for future expansion — no modals require submission
+// handling beyond what buttons/selects already cover in this build)
+// ---------------------------------------------------------------------------
+async function handleModal(interaction) {
+  return safeReply(interaction, { embeds: [infoEmbed('Received.')], ephemeral: true });
+}
+
+// ---------------------------------------------------------------------------
+// GLOBAL ERROR HANDLING
+// ---------------------------------------------------------------------------
+process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
+process.on('unhandledRejection', (err) => console.error('Unhandled Rejection:', err));
+
+client.login(process.env.DISCORD_TOKEN);
