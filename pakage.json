@@ -1,0 +1,17 @@
+{
+  "name": "all-in-one-discord-bot",
+  "version": "1.0.0",
+  "description": "Single-file all-in-one Discord.js v14 bot",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
