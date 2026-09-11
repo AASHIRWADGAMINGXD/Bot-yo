@@ -109,8 +109,8 @@ function defaultGuildConfig() {
       nextPanelId: 1,
       closedCount: 0,
     },
-    welcome: { enabled: false, channelId: null, message: 'Welcome {user} to {server}! You are member #{membercount}.', embed: true },
-    goodbye: { enabled: false, channelId: null, message: '{username} has left {server}. We now have {membercount} members.', embed: true },
+    welcome: { enabled: false, channelId: null, message: 'Welcome {user} to {server}! You are member #{membercount}.', embed: true, banner: null },
+    goodbye: { enabled: false, channelId: null, message: '{username} has left {server}. We now have {membercount} members.', embed: true, banner: null },
     autorole: { roleId: null },
     stickyroles: { enabled: false, store: {} }, // userId -> [roleIds]
     verification: { enabled: false, roleId: null, channelId: null, messageId: null },
@@ -380,12 +380,14 @@ cmd(new SlashCommandBuilder().setName('ticket').setDescription('Ticket system')
     .addChannelOption(o => o.setName('logchannel').setDescription('Ticket log channel')))
   .addSubcommand(s => s.setName('panel').setDescription('Post a ticket creation panel')
     .addStringOption(o => o.setName('title').setDescription('Panel title').setRequired(true))
-    .addStringOption(o => o.setName('description').setDescription('Panel description').setRequired(true)))
+    .addStringOption(o => o.setName('description').setDescription('Panel description').setRequired(true))
+    .addStringOption(o => o.setName('banner').setDescription('Banner image URL')))
   .addSubcommand(s => s.setName('panels').setDescription('List ticket panels'))
   .addSubcommand(s => s.setName('editpanel').setDescription('Edit a panel')
     .addIntegerOption(o => o.setName('id').setDescription('Panel ID').setRequired(true))
     .addStringOption(o => o.setName('title').setDescription('New title'))
-    .addStringOption(o => o.setName('description').setDescription('New description')))
+    .addStringOption(o => o.setName('description').setDescription('New description'))
+    .addStringOption(o => o.setName('banner').setDescription('New banner image URL')))
   .addSubcommand(s => s.setName('deletepanel').setDescription('Delete a panel')
     .addIntegerOption(o => o.setName('id').setDescription('Panel ID').setRequired(true)))
   .addSubcommand(s => s.setName('closeall').setDescription('Close all open tickets'))
@@ -409,14 +411,16 @@ cmd(new SlashCommandBuilder().setName('ticket').setDescription('Ticket system')
 cmd(new SlashCommandBuilder().setName('welcome').setDescription('Welcome message system')
   .addSubcommand(s => s.setName('setup').setDescription('Configure welcome messages')
     .addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true))
-    .addStringOption(o => o.setName('message').setDescription('Message ({user},{username},{server},{membercount})')))
+    .addStringOption(o => o.setName('message').setDescription('Message ({user},{username},{server},{membercount})'))
+    .addStringOption(o => o.setName('banner').setDescription('Banner image URL')))
   .addSubcommand(s => s.setName('test').setDescription('Send a test welcome message'))
   .addSubcommand(s => s.setName('disable').setDescription('Disable welcome messages')));
 
 cmd(new SlashCommandBuilder().setName('goodbye').setDescription('Goodbye message system')
   .addSubcommand(s => s.setName('setup').setDescription('Configure goodbye messages')
     .addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true))
-    .addStringOption(o => o.setName('message').setDescription('Message ({user},{username},{server},{membercount})')))
+    .addStringOption(o => o.setName('message').setDescription('Message ({user},{username},{server},{membercount})'))
+    .addStringOption(o => o.setName('banner').setDescription('Banner image URL')))
   .addSubcommand(s => s.setName('test').setDescription('Send a test goodbye message'))
   .addSubcommand(s => s.setName('disable').setDescription('Disable goodbye messages')));
 
@@ -629,7 +633,7 @@ async function checkAntinuke(guild, executorId, action, entity) {
       } else {
         await member.timeout(10 * 60 * 1000, 'Anti-nuke: dangerous mass action detected').catch(() => {});
         actionDesc = 'Dangerous roles stripped + 10m timeout';
-        await sendVantixTimeoutNotice(guild, gconf, { userId: executorId, type: 'Antinuke', minutes: 10 });
+        await sendVantixNotice(guild, gconf, { userId: executorId, type: 'Antinuke', action: 'Timeout (10m)', reason: `Dangerous mass action: ${action}` });
       }
       punished = true;
     } catch (e) { /* ignore */ }
@@ -662,25 +666,30 @@ const spamTracker = new Map(); // userId -> { timestamps: [], lastMsgs: [] }
 const inviteRegex = /(discord\.gg|discord\.com\/invite)\/\S+/i;
 const linkRegex = /https?:\/\/\S+/gi;
 
-// Branded timeout notification, sent whenever a member is timed out by
-// bad-word filtering, anti-spam, or anti-nuke.
-function vantixTimeoutEmbed({ userId, type, minutes }) {
+// Branded notification, sent whenever a member is actioned by
+// bad-word filtering, anti-spam, or anti-nuke. Posted both to the
+// configured log channel and in the channel where it happened.
+function vantixNoticeEmbed({ userId, type, action, reason }) {
   return new EmbedBuilder()
     .setColor(COLORS.warning)
-    .setTitle('VantixNodes')
+    .setTitle('Vantix Nodes')
     .addFields(
       { name: 'User', value: `<@${userId}>`, inline: true },
-      { name: 'Timeout', value: minutes ? `${minutes} minute(s)` : 'N/A (kicked/banned)', inline: true },
       { name: 'Type', value: type, inline: true },
+      { name: 'Action', value: action, inline: true },
+      { name: 'Reason', value: reason || 'No reason provided', inline: false },
     )
     .setTimestamp();
 }
 
-async function sendVantixTimeoutNotice(guild, gconf, { userId, type, minutes }) {
-  const embed = vantixTimeoutEmbed({ userId, type, minutes });
+async function sendVantixNotice(guild, gconf, { userId, type, action, reason }, currentChannel = null) {
+  const embed = vantixNoticeEmbed({ userId, type, action, reason });
+  if (currentChannel) {
+    currentChannel.send({ embeds: [embed] }).catch(() => {});
+  }
   if (gconf.antispam.logChannel) {
     const ch = await guild.channels.fetch(gconf.antispam.logChannel).catch(() => null);
-    if (ch) ch.send({ embeds: [embed] }).catch(() => {});
+    if (ch && ch.id !== currentChannel?.id) ch.send({ embeds: [embed] }).catch(() => {});
   }
   await logEvent(guild, gconf, embed);
 }
@@ -716,7 +725,7 @@ async function applyEscalation(message, gconf, violation, offenseKey, member) {
     }
   } catch (e) { /* missing perms etc */ }
 
-  await sendVantixTimeoutNotice(message.guild, gconf, { userId: message.author.id, type: noticeType, minutes });
+  await sendVantixNotice(message.guild, gconf, { userId: message.author.id, type: noticeType, action: actionTaken, reason: violation }, message.channel);
 
   const embed = new EmbedBuilder().setColor(COLORS.warning)
     .setTitle('🚨 AutoMod Action')
@@ -860,8 +869,8 @@ function botconfigMenu() {
 function configSummaryEmbed(gconf, section, guildId) {
   const e = new EmbedBuilder().setColor(COLORS.neutral).setTitle(`⚙️ Configuration — ${section}`).setTimestamp();
   switch (section) {
-    case 'welcome': e.setDescription(`Enabled: **${gconf.welcome.enabled}**\nChannel: ${gconf.welcome.channelId ? `<#${gconf.welcome.channelId}>` : 'none'}\nMessage: ${gconf.welcome.message}`); break;
-    case 'goodbye': e.setDescription(`Enabled: **${gconf.goodbye.enabled}**\nChannel: ${gconf.goodbye.channelId ? `<#${gconf.goodbye.channelId}>` : 'none'}\nMessage: ${gconf.goodbye.message}`); break;
+    case 'welcome': e.setDescription(`Enabled: **${gconf.welcome.enabled}**\nChannel: ${gconf.welcome.channelId ? `<#${gconf.welcome.channelId}>` : 'none'}\nMessage: ${gconf.welcome.message}\nBanner: ${gconf.welcome.banner || 'none'}`); break;
+    case 'goodbye': e.setDescription(`Enabled: **${gconf.goodbye.enabled}**\nChannel: ${gconf.goodbye.channelId ? `<#${gconf.goodbye.channelId}>` : 'none'}\nMessage: ${gconf.goodbye.message}\nBanner: ${gconf.goodbye.banner || 'none'}`); break;
     case 'antispam': e.setDescription(`Enabled: **${gconf.antispam.enabled}**\nUse \`/antispam config\` to edit thresholds.\n${JSON.stringify(gconf.antispam, null, 2).slice(0, 900)}`); break;
     case 'antinuke': e.setDescription(`Enabled: **${gconf.antinuke.enabled}**\nUse \`/antinuke config\` to edit thresholds.\n${JSON.stringify(gconf.antinuke.thresholds, null, 2)}`); break;
     case 'badwords': e.setDescription(`${gconf.badwords.length} word(s) configured. Use \`/badwords add|remove|list\`.`); break;
@@ -1142,6 +1151,7 @@ client.on('guildMemberAdd', async (member) => {
       if (gconf.welcome.embed) {
         const embed = new EmbedBuilder().setColor(COLORS.success).setTitle('👋 Welcome!').setDescription(text)
           .setThumbnail(member.user.displayAvatarURL()).setTimestamp();
+        if (gconf.welcome.banner) embed.setImage(gconf.welcome.banner);
         ch.send({ embeds: [embed] }).catch(() => {});
       } else {
         ch.send({ content: text }).catch(() => {});
@@ -1169,6 +1179,7 @@ client.on('guildMemberRemove', async (member) => {
       if (gconf.goodbye.embed) {
         const embed = new EmbedBuilder().setColor(COLORS.error).setTitle('👋 Goodbye').setDescription(text)
           .setThumbnail(member.user.displayAvatarURL()).setTimestamp();
+        if (gconf.goodbye.banner) embed.setImage(gconf.goodbye.banner);
         ch.send({ embeds: [embed] }).catch(() => {});
       } else {
         ch.send({ content: text }).catch(() => {});
@@ -1633,8 +1644,10 @@ async function handleSlash(interaction) {
       if (sub === 'setup') {
         const channel = interaction.options.getChannel('channel');
         const message = interaction.options.getString('message');
+        const banner = interaction.options.getString('banner');
         conf.enabled = true; conf.channelId = channel.id;
         if (message) conf.message = message;
+        if (banner) conf.banner = banner;
         saveDB();
         return safeReply(interaction, { embeds: [successEmbed(`${commandName} messages configured in ${channel}.`)] });
       }
@@ -1642,7 +1655,9 @@ async function handleSlash(interaction) {
         if (!conf.channelId) return safeReply(interaction, { embeds: [errorEmbed(`Run \`/${commandName} setup\` first.`)], ephemeral: true });
         const ch = await guild.channels.fetch(conf.channelId).catch(() => null);
         const text = replaceVars(conf.message, { user: interaction.user, guild });
-        if (ch) ch.send({ embeds: [new EmbedBuilder().setColor(commandName === 'welcome' ? COLORS.success : COLORS.error).setDescription(text)] });
+        const testEmbed = new EmbedBuilder().setColor(commandName === 'welcome' ? COLORS.success : COLORS.error).setDescription(text);
+        if (conf.banner) testEmbed.setImage(conf.banner);
+        if (ch) ch.send({ embeds: [testEmbed] });
         return safeReply(interaction, { embeds: [successEmbed('Test message sent.')], ephemeral: true });
       }
       if (sub === 'disable') {
@@ -2096,8 +2111,10 @@ async function handleTicketCommand(interaction, gconf) {
     if (!gconf.tickets.categoryId) return safeReply(interaction, { embeds: [errorEmbed('Run `/ticket setup` first.')], ephemeral: true });
     const title = interaction.options.getString('title');
     const description = interaction.options.getString('description');
+    const banner = interaction.options.getString('banner');
     const types = Object.keys(gconf.tickets.types);
     const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(title).setDescription(description).setTimestamp();
+    if (banner) embed.setImage(banner);
     let row;
     if (types.length) {
       row = new ActionRowBuilder().addComponents(
@@ -2109,7 +2126,7 @@ async function handleTicketCommand(interaction, gconf) {
     }
     const msg = await interaction.channel.send({ embeds: [embed], components: [row] });
     const panelId = gconf.tickets.nextPanelId++;
-    gconf.tickets.panels[panelId] = { channelId: interaction.channel.id, messageId: msg.id, title, description };
+    gconf.tickets.panels[panelId] = { channelId: interaction.channel.id, messageId: msg.id, title, description, banner: banner || null };
     saveDB();
     return safeReply(interaction, { embeds: [successEmbed(`Panel #${panelId} posted.`)], ephemeral: true });
   }
@@ -2124,10 +2141,13 @@ async function handleTicketCommand(interaction, gconf) {
     if (!panel) return safeReply(interaction, { embeds: [errorEmbed('Panel not found.')], ephemeral: true });
     const title = interaction.options.getString('title') || panel.title;
     const description = interaction.options.getString('description') || panel.description;
-    panel.title = title; panel.description = description;
+    const banner = interaction.options.getString('banner') || panel.banner;
+    panel.title = title; panel.description = description; panel.banner = banner || null;
     const ch = await guild.channels.fetch(panel.channelId).catch(() => null);
     const msg = ch ? await ch.messages.fetch(panel.messageId).catch(() => null) : null;
-    if (msg) msg.edit({ embeds: [new EmbedBuilder().setColor(COLORS.info).setTitle(title).setDescription(description)] }).catch(() => {});
+    const editedEmbed = new EmbedBuilder().setColor(COLORS.info).setTitle(title).setDescription(description);
+    if (banner) editedEmbed.setImage(banner);
+    if (msg) msg.edit({ embeds: [editedEmbed] }).catch(() => {});
     saveDB();
     return safeReply(interaction, { embeds: [successEmbed(`Panel #${id} updated.`)] });
   }
