@@ -629,6 +629,7 @@ async function checkAntinuke(guild, executorId, action, entity) {
       } else {
         await member.timeout(10 * 60 * 1000, 'Anti-nuke: dangerous mass action detected').catch(() => {});
         actionDesc = 'Dangerous roles stripped + 10m timeout';
+        await sendVantixTimeoutNotice(guild, gconf, { userId: executorId, type: 'Antinuke', minutes: 10 });
       }
       punished = true;
     } catch (e) { /* ignore */ }
@@ -661,6 +662,29 @@ const spamTracker = new Map(); // userId -> { timestamps: [], lastMsgs: [] }
 const inviteRegex = /(discord\.gg|discord\.com\/invite)\/\S+/i;
 const linkRegex = /https?:\/\/\S+/gi;
 
+// Branded timeout notification, sent whenever a member is timed out by
+// bad-word filtering, anti-spam, or anti-nuke.
+function vantixTimeoutEmbed({ userId, type, minutes }) {
+  return new EmbedBuilder()
+    .setColor(COLORS.warning)
+    .setTitle('VantixNodes')
+    .addFields(
+      { name: 'User', value: `<@${userId}>`, inline: true },
+      { name: 'Timeout', value: minutes ? `${minutes} minute(s)` : 'N/A (kicked/banned)', inline: true },
+      { name: 'Type', value: type, inline: true },
+    )
+    .setTimestamp();
+}
+
+async function sendVantixTimeoutNotice(guild, gconf, { userId, type, minutes }) {
+  const embed = vantixTimeoutEmbed({ userId, type, minutes });
+  if (gconf.antispam.logChannel) {
+    const ch = await guild.channels.fetch(gconf.antispam.logChannel).catch(() => null);
+    if (ch) ch.send({ embeds: [embed] }).catch(() => {});
+  }
+  await logEvent(guild, gconf, embed);
+}
+
 async function applyEscalation(message, gconf, violation, offenseKey, member) {
   await message.delete().catch(() => {});
 
@@ -670,25 +694,29 @@ async function applyEscalation(message, gconf, violation, offenseKey, member) {
   gconf.warnings[message.author.id].push({ reason: reasonText, mod: 'AutoMod', ts: Date.now() });
   saveDB();
 
+  const noticeType = offenseKey === '[AutoMod-BadWord]' ? 'Blockword' : 'Automod';
   let actionTaken = 'Deleted + Warned';
+  let minutes = null;
   try {
     if (priorOffenses === 0) {
       await member?.timeout(5 * 60 * 1000, reasonText).catch(() => {});
-      actionTaken = 'Deleted + 5m Timeout';
+      actionTaken = 'Deleted + 5m Timeout'; minutes = 5;
     } else if (priorOffenses === 1) {
       await member?.timeout(30 * 60 * 1000, reasonText).catch(() => {});
-      actionTaken = 'Deleted + 30m Timeout';
+      actionTaken = 'Deleted + 30m Timeout'; minutes = 30;
     } else if (priorOffenses === 2) {
       await member?.timeout(6 * 60 * 60 * 1000, reasonText).catch(() => {});
-      actionTaken = 'Deleted + 6h Timeout';
+      actionTaken = 'Deleted + 6h Timeout'; minutes = 360;
     } else if (priorOffenses === 3) {
       await member?.timeout(24 * 60 * 60 * 1000, reasonText).catch(() => {});
-      actionTaken = 'Deleted + 24h Timeout';
+      actionTaken = 'Deleted + 24h Timeout'; minutes = 1440;
     } else {
       await member?.kick(reasonText).catch(() => {});
-      actionTaken = 'Deleted + Kicked';
+      actionTaken = 'Deleted + Kicked'; minutes = null;
     }
   } catch (e) { /* missing perms etc */ }
+
+  await sendVantixTimeoutNotice(message.guild, gconf, { userId: message.author.id, type: noticeType, minutes });
 
   const embed = new EmbedBuilder().setColor(COLORS.warning)
     .setTitle('🚨 AutoMod Action')
@@ -879,19 +907,45 @@ async function statusMonitorTick() {
     for (const mon of gconf.statusmonitors) {
       const online = await checkUrl(mon.url);
       const status = online ? 'online' : 'offline';
-      if (mon.lastStatus !== status) {
-        mon.lastStatus = status;
-        saveDB();
-        const ch = await guild.channels.fetch(mon.channelId).catch(() => null);
-        if (ch) {
-          const embed = online ? successEmbed(`${mon.url} is back **online**.`, 'Status Update') : errorEmbed(`${mon.url} appears to be **offline**.`, 'Status Update');
-          ch.send({ embeds: [embed] }).catch(() => {});
+      const statusChanged = mon.lastStatus !== status;
+      mon.lastStatus = status;
+
+      const ch = await guild.channels.fetch(mon.channelId).catch(() => null);
+      if (!ch) continue;
+
+      const embed = new EmbedBuilder()
+        .setColor(online ? COLORS.success : COLORS.error)
+        .setTitle('📡 Status Monitor')
+        .addFields(
+          { name: 'URL', value: mon.url, inline: false },
+          { name: 'Status', value: online ? '🟢 Online' : '🔴 Offline', inline: true },
+          { name: 'Ping', value: `${Math.round(client.ws.ping)}ms`, inline: true },
+        )
+        .setFooter({ text: `Last updated: ${new Date().toLocaleTimeString()}` })
+        .setTimestamp();
+
+      if (mon.messageId) {
+        const msg = await ch.messages.fetch(mon.messageId).catch(() => null);
+        if (msg) {
+          await msg.edit({ embeds: [embed] }).catch(() => {});
+        } else {
+          const sent = await ch.send({ embeds: [embed] }).catch(() => null);
+          if (sent) mon.messageId = sent.id;
         }
+      } else {
+        const sent = await ch.send({ embeds: [embed] }).catch(() => null);
+        if (sent) mon.messageId = sent.id;
+      }
+
+      if (statusChanged) {
+        const alertEmbed = online ? successEmbed(`${mon.url} is back **online**.`, 'Status Update') : errorEmbed(`${mon.url} appears to be **offline**.`, 'Status Update');
+        ch.send({ embeds: [alertEmbed] }).catch(() => {});
       }
     }
   }
+  saveDB();
 }
-setInterval(statusMonitorTick, 5 * 60 * 1000);
+setInterval(statusMonitorTick, 60 * 1000);
 
 // ---------------------------------------------------------------------------
 // LIVE PING STATUS MESSAGE (edits every minute)
@@ -1734,7 +1788,7 @@ async function handleSlash(interaction) {
         const url = interaction.options.getString('url');
         if (!/^https?:\/\//i.test(url)) return safeReply(interaction, { embeds: [errorEmbed('URL must start with http:// or https://')], ephemeral: true });
         const channel = interaction.options.getChannel('channel');
-        gconf.statusmonitors.push({ url, channelId: channel.id, lastStatus: null });
+        gconf.statusmonitors.push({ url, channelId: channel.id, lastStatus: null, messageId: null });
         saveDB();
         return safeReply(interaction, { embeds: [successEmbed(`Now monitoring ${url}.`)] });
       }
