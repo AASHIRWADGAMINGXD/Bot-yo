@@ -25,6 +25,7 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const express = require('express');
+const Database = require('better-sqlite3');
 
 const {
   Client, GatewayIntentBits, Partials, Collection, REST, Routes,
@@ -78,8 +79,8 @@ function defaultGuildConfig() {
     antinuke: {
       enabled: false,
       whitelist: [],
-      thresholds: { channelDelete: 3, channelCreate: 5, roleDelete: 3, roleCreate: 5, ban: 3, kick: 3, webhook: 3 },
-      windowMs: 10000,
+      thresholds: { channelDelete: 2, channelCreate: 3, roleDelete: 2, roleCreate: 3, ban: 2, kick: 3, webhook: 2 },
+      windowMs: 8000,
       logChannel: null,
       logs: [],
     },
@@ -89,8 +90,8 @@ function defaultGuildConfig() {
       msgLimit: 5,
       msgWindowMs: 5000,
       duplicateWindowMs: 15000,
-      mentionLimit: 5,
-      capsPercent: 70,
+      mentionLimit: 4,
+      capsPercent: 65,
       linkLimit: 2,
       blockInvites: true,
       repeatedCharLimit: 8,
@@ -102,8 +103,8 @@ function defaultGuildConfig() {
       supportRoles: [],
       panels: {}, // panelId -> {channelId, messageId, title, description, types:[]}
       types: {}, // typeName -> {label, emoji}
-      openTickets: {}, // channelId -> {userId, type, claimedBy, createdAt}
-      userTicketCount: {},
+      openTickets: {}, // deprecated (JSON) — kept only for backward-compat migration; live data now in SQLite
+      userTicketCount: {}, // deprecated
       logChannel: null,
       nextPanelId: 1,
       closedCount: 0,
@@ -143,8 +144,55 @@ function getGuild(guildId) {
 }
 
 // ---------------------------------------------------------------------------
-// CLIENT
+// SQLITE DATABASE — TICKET SYSTEM
 // ---------------------------------------------------------------------------
+const SQLITE_FILE = path.join(DATA_DIR, 'tickets.db');
+const sqlite = new Database(SQLITE_FILE);
+sqlite.pragma('journal_mode = WAL');
+
+sqlite.exec(`
+  CREATE TABLE IF NOT EXISTS tickets (
+    channel_id   TEXT PRIMARY KEY,
+    guild_id     TEXT NOT NULL,
+    user_id      TEXT NOT NULL,
+    type         TEXT DEFAULT 'general',
+    claimed_by   TEXT,
+    status       TEXT DEFAULT 'open',
+    created_at   INTEGER NOT NULL,
+    closed_at    INTEGER,
+    closed_by    TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_tickets_guild ON tickets(guild_id);
+  CREATE INDEX IF NOT EXISTS idx_tickets_user ON tickets(guild_id, user_id);
+  CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(guild_id, status);
+
+  CREATE TABLE IF NOT EXISTS ticket_transcripts (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id   TEXT NOT NULL,
+    guild_id     TEXT NOT NULL,
+    author_tag   TEXT,
+    content      TEXT,
+    attachments  TEXT,
+    created_at   INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_transcripts_channel ON ticket_transcripts(channel_id);
+`);
+
+const ticketDB = {
+  create: sqlite.prepare(`INSERT INTO tickets (channel_id, guild_id, user_id, type, created_at, status) VALUES (?, ?, ?, ?, ?, 'open')`),
+  getOpenByChannel: sqlite.prepare(`SELECT * FROM tickets WHERE channel_id = ? AND status = 'open'`),
+  getByChannel: sqlite.prepare(`SELECT * FROM tickets WHERE channel_id = ?`),
+  countOpenByUser: sqlite.prepare(`SELECT COUNT(*) AS c FROM tickets WHERE guild_id = ? AND user_id = ? AND status = 'open'`),
+  claim: sqlite.prepare(`UPDATE tickets SET claimed_by = ? WHERE channel_id = ?`),
+  close: sqlite.prepare(`UPDATE tickets SET status = 'closed', closed_at = ?, closed_by = ? WHERE channel_id = ?`),
+  allOpenByGuild: sqlite.prepare(`SELECT * FROM tickets WHERE guild_id = ? AND status = 'open'`),
+  countClosedByGuild: sqlite.prepare(`SELECT COUNT(*) AS c FROM tickets WHERE guild_id = ? AND status = 'closed'`),
+  countOpenByGuild: sqlite.prepare(`SELECT COUNT(*) AS c FROM tickets WHERE guild_id = ? AND status = 'open'`),
+  addTranscriptLine: sqlite.prepare(`INSERT INTO ticket_transcripts (channel_id, guild_id, author_tag, content, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?)`),
+  getTranscript: sqlite.prepare(`SELECT * FROM ticket_transcripts WHERE channel_id = ? ORDER BY created_at ASC`),
+};
+
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -559,7 +607,9 @@ async function checkAntinuke(guild, executorId, action, entity) {
 
   // Trigger response
   const member = await guild.members.fetch(executorId).catch(() => null);
+  const priorTriggers = gconf.antinuke.logs.filter(l => l.executorId === executorId).length;
   let punished = false;
+  let actionDesc = 'Could not act (hierarchy/permissions)';
   if (member && botCanActOn(guild, member)) {
     try {
       // strip dangerous roles/permissions
@@ -572,7 +622,14 @@ async function checkAntinuke(guild, executorId, action, entity) {
       for (const [, role] of dangerousRoles) {
         await member.roles.remove(role, 'Anti-nuke: dangerous mass action detected').catch(() => {});
       }
-      await member.timeout(10 * 60 * 1000, 'Anti-nuke: dangerous mass action detected').catch(() => {});
+      if (priorTriggers >= 1) {
+        // repeat offender within tracked history — strict escalation to ban
+        await member.ban({ reason: 'Anti-nuke: repeat dangerous mass action detected' }).catch(() => {});
+        actionDesc = 'Dangerous roles stripped + banned (repeat offender)';
+      } else {
+        await member.timeout(10 * 60 * 1000, 'Anti-nuke: dangerous mass action detected').catch(() => {});
+        actionDesc = 'Dangerous roles stripped + 10m timeout';
+      }
       punished = true;
     } catch (e) { /* ignore */ }
   }
@@ -588,7 +645,7 @@ async function checkAntinuke(guild, executorId, action, entity) {
     .addFields(
       { name: 'Executor', value: `<@${executorId}> (${executorId})`, inline: true },
       { name: 'Occurrences', value: `${arr.length} within ${Math.round(windowMs / 1000)}s`, inline: true },
-      { name: 'Action Taken', value: punished ? 'Dangerous roles stripped + 10m timeout' : 'Could not act (hierarchy/permissions)', inline: false },
+      { name: 'Action Taken', value: actionDesc, inline: false },
     ).setTimestamp();
 
   if (gconf.antinuke.logChannel) {
@@ -598,18 +655,87 @@ async function checkAntinuke(guild, executorId, action, entity) {
 }
 
 // ---------------------------------------------------------------------------
-// ANTI-SPAM TRACKING
+// ANTI-SPAM TRACKING (Discord-AutoMod style: detect -> block -> escalate)
 // ---------------------------------------------------------------------------
 const spamTracker = new Map(); // userId -> { timestamps: [], lastMsgs: [] }
 const inviteRegex = /(discord\.gg|discord\.com\/invite)\/\S+/i;
 const linkRegex = /https?:\/\/\S+/gi;
+
+async function applyEscalation(message, gconf, violation, offenseKey, member) {
+  await message.delete().catch(() => {});
+
+  if (!gconf.warnings[message.author.id]) gconf.warnings[message.author.id] = [];
+  const priorOffenses = gconf.warnings[message.author.id].filter(w => w.reason.startsWith(offenseKey)).length;
+  const reasonText = `${offenseKey} ${violation}`;
+  gconf.warnings[message.author.id].push({ reason: reasonText, mod: 'AutoMod', ts: Date.now() });
+  saveDB();
+
+  let actionTaken = 'Deleted + Warned';
+  try {
+    if (priorOffenses === 0) {
+      await member?.timeout(5 * 60 * 1000, reasonText).catch(() => {});
+      actionTaken = 'Deleted + 5m Timeout';
+    } else if (priorOffenses === 1) {
+      await member?.timeout(30 * 60 * 1000, reasonText).catch(() => {});
+      actionTaken = 'Deleted + 30m Timeout';
+    } else if (priorOffenses === 2) {
+      await member?.timeout(6 * 60 * 60 * 1000, reasonText).catch(() => {});
+      actionTaken = 'Deleted + 6h Timeout';
+    } else if (priorOffenses === 3) {
+      await member?.timeout(24 * 60 * 60 * 1000, reasonText).catch(() => {});
+      actionTaken = 'Deleted + 24h Timeout';
+    } else {
+      await member?.kick(reasonText).catch(() => {});
+      actionTaken = 'Deleted + Kicked';
+    }
+  } catch (e) { /* missing perms etc */ }
+
+  const embed = new EmbedBuilder().setColor(COLORS.warning)
+    .setTitle('🚨 AutoMod Action')
+    .addFields(
+      { name: 'User', value: `<@${message.author.id}>`, inline: true },
+      { name: 'Violation', value: violation, inline: true },
+      { name: 'Action', value: actionTaken, inline: true },
+      { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
+    ).setTimestamp();
+  if (gconf.antispam.logChannel) {
+    const ch = await message.guild.channels.fetch(gconf.antispam.logChannel).catch(() => null);
+    if (ch) ch.send({ embeds: [embed] }).catch(() => {});
+  }
+  await logEvent(message.guild, gconf, embed);
+}
+
+// Bad-word filter — behaves like a strict Discord AutoMod rule: runs
+// independently of the general anti-spam toggle, and is not bypassed
+// merely by having Manage Messages (only protected users / mods with
+// explicit bypass are exempt via isProtected + level check below).
+async function handleBadWords(message) {
+  const gconf = getGuild(message.guild.id);
+  if (!gconf.badwords || !gconf.badwords.length) return false;
+  if (isProtected(message.guild, gconf, message.author.id)) return false;
+
+  const lower = message.content.toLowerCase();
+  const hit = gconf.badwords.some(w => {
+    const word = w.toLowerCase();
+    // strict whole-word-ish match (word boundaries) to reduce false positives
+    // while still catching leetspeak-free direct usage; falls back to substring
+    // match for multi-word phrases.
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i');
+    return re.test(lower) || lower.includes(word);
+  });
+  if (!hit) return false;
+
+  const member = message.member;
+  await applyEscalation(message, gconf, 'Bad word', '[AutoMod-BadWord]', member);
+  return true;
+}
 
 async function handleAntispam(message) {
   const gconf = getGuild(message.guild.id);
   if (!gconf.antispam.enabled) return;
   if (isProtected(message.guild, gconf, message.author.id)) return;
   const member = message.member;
-  if (member?.permissions.has(PermissionFlagsBits.ManageMessages)) return;
 
   const key = `${message.guild.id}:${message.author.id}`;
   if (!spamTracker.has(key)) spamTracker.set(key, { timestamps: [], lastMsgs: [] });
@@ -641,56 +767,12 @@ async function handleAntispam(message) {
     const repeated = /(.)\1{7,}/.exec(message.content);
     if (repeated && repeated[0].length >= gconf.antispam.repeatedCharLimit) violation = 'Repeated characters';
   }
-  if (!gconf.badwords) gconf.badwords = [];
-  if (!violation && gconf.badwords.length) {
-    const lower = message.content.toLowerCase();
-    if (gconf.badwords.some(w => lower.includes(w.toLowerCase()))) violation = 'Bad word';
-  }
 
   if (!violation) return;
+  // Manage Messages holders bypass generic spam heuristics (still subject to bad-word filter above)
+  if (member?.permissions.has(PermissionFlagsBits.ManageMessages)) return;
 
-  await message.delete().catch(() => {});
-
-  // escalation
-  const wkey = `${message.guild.id}_offense`;
-  if (!gconf.warnings[message.author.id]) gconf.warnings[message.author.id] = [];
-  const priorOffenses = gconf.warnings[message.author.id].filter(w => w.reason.startsWith('[AutoMod]')).length;
-  const reasonText = `[AutoMod] ${violation}`;
-  gconf.warnings[message.author.id].push({ reason: reasonText, mod: 'AutoMod', ts: Date.now() });
-  saveDB();
-
-  let actionTaken = 'Warned';
-  try {
-    if (priorOffenses === 0) {
-      actionTaken = 'Deleted + Warned';
-    } else if (priorOffenses === 1) {
-      await member.timeout(5 * 60 * 1000, reasonText).catch(() => {});
-      actionTaken = 'Deleted + 5m Timeout';
-    } else if (priorOffenses === 2) {
-      await member.timeout(30 * 60 * 1000, reasonText).catch(() => {});
-      actionTaken = 'Deleted + 30m Timeout';
-    } else if (priorOffenses >= 3 && priorOffenses < 5) {
-      await member.timeout(6 * 60 * 60 * 1000, reasonText).catch(() => {});
-      actionTaken = 'Deleted + 6h Timeout';
-    } else {
-      await member.kick(reasonText).catch(() => {});
-      actionTaken = 'Deleted + Kicked';
-    }
-  } catch (e) { /* missing perms etc */ }
-
-  const embed = new EmbedBuilder().setColor(COLORS.warning)
-    .setTitle('🚨 AutoMod Action')
-    .addFields(
-      { name: 'User', value: `<@${message.author.id}>`, inline: true },
-      { name: 'Violation', value: violation, inline: true },
-      { name: 'Action', value: actionTaken, inline: true },
-      { name: 'Channel', value: `<#${message.channel.id}>`, inline: true },
-    ).setTimestamp();
-  if (gconf.antispam.logChannel) {
-    const ch = await message.guild.channels.fetch(gconf.antispam.logChannel).catch(() => null);
-    if (ch) ch.send({ embeds: [embed] }).catch(() => {});
-  }
-  await logEvent(message.guild, gconf, embed);
+  await applyEscalation(message, gconf, violation, '[AutoMod-Spam]', member);
 }
 
 // ---------------------------------------------------------------------------
@@ -747,7 +829,7 @@ function botconfigMenu() {
   return row;
 }
 
-function configSummaryEmbed(gconf, section) {
+function configSummaryEmbed(gconf, section, guildId) {
   const e = new EmbedBuilder().setColor(COLORS.neutral).setTitle(`⚙️ Configuration — ${section}`).setTimestamp();
   switch (section) {
     case 'welcome': e.setDescription(`Enabled: **${gconf.welcome.enabled}**\nChannel: ${gconf.welcome.channelId ? `<#${gconf.welcome.channelId}>` : 'none'}\nMessage: ${gconf.welcome.message}`); break;
@@ -755,7 +837,11 @@ function configSummaryEmbed(gconf, section) {
     case 'antispam': e.setDescription(`Enabled: **${gconf.antispam.enabled}**\nUse \`/antispam config\` to edit thresholds.\n${JSON.stringify(gconf.antispam, null, 2).slice(0, 900)}`); break;
     case 'antinuke': e.setDescription(`Enabled: **${gconf.antinuke.enabled}**\nUse \`/antinuke config\` to edit thresholds.\n${JSON.stringify(gconf.antinuke.thresholds, null, 2)}`); break;
     case 'badwords': e.setDescription(`${gconf.badwords.length} word(s) configured. Use \`/badwords add|remove|list\`.`); break;
-    case 'tickets': e.setDescription(`Category: ${gconf.tickets.categoryId ? `<#${gconf.tickets.categoryId}>` : 'not set'}\nSupport roles: ${gconf.tickets.supportRoles.map(r => `<@&${r}>`).join(', ') || 'none'}\nOpen tickets: ${Object.keys(gconf.tickets.openTickets).length}`); break;
+    case 'tickets': {
+      const openCount = (ticketDB.countOpenByGuild.get(guildId || '') || { c: 0 }).c;
+      e.setDescription(`Category: ${gconf.tickets.categoryId ? `<#${gconf.tickets.categoryId}>` : 'not set'}\nSupport roles: ${gconf.tickets.supportRoles.map(r => `<@&${r}>`).join(', ') || 'none'}\nOpen tickets: ${openCount}`);
+      break;
+    }
     case 'verification': e.setDescription(`Enabled: **${gconf.verification.enabled}**\nRole: ${gconf.verification.roleId ? `<@&${gconf.verification.roleId}>` : 'none'}\nChannel: ${gconf.verification.channelId ? `<#${gconf.verification.channelId}>` : 'none'}`); break;
     case 'autorole': e.setDescription(`Role: ${gconf.autorole.roleId ? `<@&${gconf.autorole.roleId}>` : 'none set'}\nUse \`/autorole set|remove\`.`); break;
     case 'stickyroles': e.setDescription(`Enabled: **${gconf.stickyroles.enabled}**`); break;
@@ -1044,6 +1130,13 @@ client.on('messageCreate', async (message) => {
   if (!message.guild || message.author.bot) return;
   const gconf = getGuild(message.guild.id);
 
+  // live ticket transcript logging
+  const ticketRow = ticketDB.getOpenByChannel.get(message.channel.id);
+  if (ticketRow) {
+    const attachments = message.attachments.size ? [...message.attachments.values()].map(a => a.url).join(' ') : null;
+    ticketDB.addTranscriptLine.run(message.channel.id, message.guild.id, message.author.tag, message.content || '', attachments, Date.now());
+  }
+
   // AFK removal
   if (gconf.afk[message.author.id]) {
     delete gconf.afk[message.author.id];
@@ -1066,6 +1159,8 @@ client.on('messageCreate', async (message) => {
     }
   }
 
+  const wordBlocked = await handleBadWords(message).catch(e => { console.error('badwords error:', e); return false; });
+  if (wordBlocked) return; // message already deleted + actioned; skip further spam checks on it
   await handleAntispam(message).catch(e => console.error('antispam error:', e));
 });
 
@@ -1993,14 +2088,13 @@ async function handleTicketCommand(interaction, gconf) {
   }
   if (sub === 'closeall') {
     await interaction.deferReply({ ephemeral: true });
+    const openRows = ticketDB.allOpenByGuild.all(guild.id);
     let count = 0;
-    for (const chId of Object.keys(gconf.tickets.openTickets)) {
-      const ch = await guild.channels.fetch(chId).catch(() => null);
+    for (const row of openRows) {
+      const ch = await guild.channels.fetch(row.channel_id).catch(() => null);
       if (ch) { await ch.delete().catch(() => {}); count++; }
-      delete gconf.tickets.openTickets[chId];
+      ticketDB.close.run(Date.now(), interaction.user.id, row.channel_id);
     }
-    gconf.tickets.closedCount += count;
-    saveDB();
     return safeReply(interaction, { embeds: [successEmbed(`Closed ${count} ticket(s).`)] });
   }
   if (sub === 'addtype') {
@@ -2027,50 +2121,57 @@ async function handleTicketCommand(interaction, gconf) {
     return safeReply(interaction, { embeds: [successEmbed(`Type **${name}** deleted.`)] });
   }
   if (sub === 'config') {
-    return safeReply(interaction, { embeds: [configSummaryEmbed(gconf, 'tickets')] });
+    return safeReply(interaction, { embeds: [configSummaryEmbed(gconf, 'tickets', guild.id)] });
   }
 
-  // ---- ticket-channel-scoped subcommands ----
-  const ticketData = gconf.tickets.openTickets[interaction.channel.id];
+  // ---- ticket-channel-scoped subcommands (backed by SQLite) ----
+  const ticketRow = ticketDB.getOpenByChannel.get(interaction.channel.id);
 
   if (sub === 'add' || sub === 'remove') {
-    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
     const user = interaction.options.getUser('user');
     if (sub === 'add') await interaction.channel.permissionOverwrites.edit(user.id, { ViewChannel: true, SendMessages: true });
     else await interaction.channel.permissionOverwrites.delete(user.id);
     return safeReply(interaction, { embeds: [successEmbed(`${user} ${sub === 'add' ? 'added to' : 'removed from'} the ticket.`)] });
   }
   if (sub === 'claim') {
-    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
-    ticketData.claimedBy = interaction.user.id; saveDB();
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    ticketDB.claim.run(interaction.user.id, interaction.channel.id);
     return safeReply(interaction, { embeds: [successEmbed(`Ticket claimed by ${interaction.user}.`)] });
   }
   if (sub === 'close') {
-    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
     await safeReply(interaction, { embeds: [warnEmbed('Closing this ticket in 5 seconds...')] });
     const logCh = gconf.tickets.logChannel ? await guild.channels.fetch(gconf.tickets.logChannel).catch(() => null) : null;
     if (logCh) logCh.send({ embeds: [infoEmbed(`Ticket <#${interaction.channel.id}> closed by ${interaction.user}.`, '🎫 Ticket Closed')] }).catch(() => {});
-    delete gconf.tickets.openTickets[interaction.channel.id];
-    gconf.tickets.closedCount++;
-    saveDB();
+    ticketDB.close.run(Date.now(), interaction.user.id, interaction.channel.id);
     setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
     return;
   }
   if (sub === 'transcript') {
-    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
     await interaction.deferReply();
-    const messages = await interaction.channel.messages.fetch({ limit: 100 });
-    const sorted = [...messages.values()].reverse();
-    const lines = sorted.map(m => `[${m.createdAt.toISOString()}] ${m.author.tag}: ${m.content}${m.attachments.size ? ' ' + [...m.attachments.values()].map(a => a.url).join(' ') : ''}`);
+    const rows = ticketDB.getTranscript.all(interaction.channel.id);
+    let lines;
+    if (rows.length) {
+      lines = rows.map(r => `[${new Date(r.created_at).toISOString()}] ${r.author_tag}: ${r.content}${r.attachments ? ' ' + r.attachments : ''}`);
+    } else {
+      // fallback: pull directly from the channel if no live-logged rows exist yet
+      const messages = await interaction.channel.messages.fetch({ limit: 100 });
+      const sorted = [...messages.values()].reverse();
+      lines = sorted.map(m => `[${m.createdAt.toISOString()}] ${m.author.tag}: ${m.content}${m.attachments.size ? ' ' + [...m.attachments.values()].map(a => a.url).join(' ') : ''}`);
+    }
     const buffer = Buffer.from(lines.join('\n'), 'utf8');
     const attachment = new AttachmentBuilder(buffer, { name: `transcript-${interaction.channel.id}.txt` });
     return safeReply(interaction, { content: 'Transcript generated:', files: [attachment] });
   }
   if (sub === 'stats') {
-    const open = Object.keys(gconf.tickets.openTickets).length;
-    return safeReply(interaction, { embeds: [infoEmbed(`Open tickets: **${open}**\nTotal closed: **${gconf.tickets.closedCount}**`, '🎫 Ticket Stats')] });
+    const open = (ticketDB.countOpenByGuild.get(guild.id) || { c: 0 }).c;
+    const closed = (ticketDB.countClosedByGuild.get(guild.id) || { c: 0 }).c;
+    return safeReply(interaction, { embeds: [infoEmbed(`Open tickets: **${open}**\nTotal closed: **${closed}**`, '🎫 Ticket Stats')] });
   }
 }
+
 
 // ---------------------------------------------------------------------------
 // TICKET CREATION HELPER (shared by button + select menu)
@@ -2079,8 +2180,7 @@ async function createTicket(interaction, gconf, type = 'general') {
   const guild = interaction.guild;
   if (!gconf.tickets.categoryId) return safeReply(interaction, { embeds: [errorEmbed('Ticket system is not configured yet.')], ephemeral: true });
 
-  const userCount = gconf.tickets.userTicketCount[interaction.user.id] || 0;
-  const openForUser = Object.values(gconf.tickets.openTickets).filter(t => t.userId === interaction.user.id).length;
+  const openForUser = (ticketDB.countOpenByUser.get(guild.id, interaction.user.id) || { c: 0 }).c;
   if (openForUser >= 3) return safeReply(interaction, { embeds: [errorEmbed('You already have the maximum number of open tickets (3).')], ephemeral: true });
 
   const overwrites = [
@@ -2101,9 +2201,7 @@ async function createTicket(interaction, gconf, type = 'general') {
 
   if (!channel) return safeReply(interaction, { embeds: [errorEmbed('Failed to create ticket channel (check my permissions/category).')], ephemeral: true });
 
-  gconf.tickets.openTickets[channel.id] = { userId: interaction.user.id, type, claimedBy: null, createdAt: Date.now() };
-  gconf.tickets.userTicketCount[interaction.user.id] = userCount + 1;
-  saveDB();
+  ticketDB.create.run(channel.id, guild.id, interaction.user.id, type, Date.now());
 
   const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(`🎫 Ticket — ${type}`)
     .setDescription(`Welcome ${interaction.user}, support will be with you shortly.\nUse the buttons below to manage this ticket.`).setTimestamp();
@@ -2135,20 +2233,18 @@ async function handleButton(interaction) {
   if (id === 'ticket_create_default') return createTicket(interaction, gconf, 'general');
 
   if (id === 'ticket_claim') {
-    const ticketData = gconf.tickets.openTickets[interaction.channel.id];
-    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
-    ticketData.claimedBy = interaction.user.id; saveDB();
+    const ticketRow = ticketDB.getOpenByChannel.get(interaction.channel.id);
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    ticketDB.claim.run(interaction.user.id, interaction.channel.id);
     return safeReply(interaction, { embeds: [successEmbed(`Claimed by ${interaction.user}.`)] });
   }
   if (id === 'ticket_close') {
-    const ticketData = gconf.tickets.openTickets[interaction.channel.id];
-    if (!ticketData) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
+    const ticketRow = ticketDB.getOpenByChannel.get(interaction.channel.id);
+    if (!ticketRow) return safeReply(interaction, { embeds: [errorEmbed('This is not a ticket channel.')], ephemeral: true });
     await safeReply(interaction, { embeds: [warnEmbed('Closing this ticket in 5 seconds...')] });
     const logCh = gconf.tickets.logChannel ? await interaction.guild.channels.fetch(gconf.tickets.logChannel).catch(() => null) : null;
     if (logCh) logCh.send({ embeds: [infoEmbed(`Ticket <#${interaction.channel.id}> closed by ${interaction.user}.`, '🎫 Ticket Closed')] }).catch(() => {});
-    delete gconf.tickets.openTickets[interaction.channel.id];
-    gconf.tickets.closedCount++;
-    saveDB();
+    ticketDB.close.run(Date.now(), interaction.user.id, interaction.channel.id);
     setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
     return;
   }
@@ -2184,7 +2280,7 @@ async function handleSelect(interaction) {
   const gconf = getGuild(interaction.guild.id);
   if (interaction.customId === 'botconfig_select') {
     const section = interaction.values[0];
-    return interaction.update({ embeds: [configSummaryEmbed(gconf, section)], components: [botconfigMenu()] });
+    return interaction.update({ embeds: [configSummaryEmbed(gconf, section, interaction.guild.id)], components: [botconfigMenu()] });
   }
   if (interaction.customId === 'ticket_create_select') {
     const type = interaction.values[0];
