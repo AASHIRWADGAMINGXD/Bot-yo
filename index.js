@@ -470,6 +470,8 @@ cmd(new SlashCommandBuilder().setName('reactionrole').setDescription('Reaction r
     .addStringOption(o => o.setName('emoji').setDescription('Emoji').setRequired(true)))
   .addSubcommand(s => s.setName('list').setDescription('List reaction roles')));
 
+cmd(new SlashCommandBuilder().setName('pingstatus').setDescription('Start a live ping status message that updates every minute in this channel'));
+
 cmd(new SlashCommandBuilder().setName('autopublish').setDescription('Auto-publish announcement channels')
   .addSubcommand(s => s.setName('setup').setDescription('Add an announcement channel to auto-publish').addChannelOption(o => o.setName('channel').setDescription('Announcement channel').setRequired(true)))
   .addSubcommand(s => s.setName('remove').setDescription('Remove an auto-publish channel').addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true))));
@@ -486,7 +488,7 @@ const HELP_CATEGORIES = {
   'DM SYSTEM': ['dm', 'dmlogs'],
   'INVITES': ['invites', 'inviteleaderboard', 'resetinvites'],
   'UTILITY & TOOLS': ['customcommand', 'giveaway', 'statusmonitor', 'weather', 'qrcode', 'remindme', 'poll', 'afk'],
-  'INFORMATION': ['serverinfo', 'userinfo', 'roleinfo', 'avatar', 'banner', 'membercount', 'ping', 'stats', 'help'],
+  'INFORMATION': ['serverinfo', 'userinfo', 'roleinfo', 'avatar', 'banner', 'membercount', 'ping', 'stats', 'help', 'pingstatus'],
   'SERVER MANAGEMENT': ['autorole', 'stickyroles', 'addrole', 'removerole', 'verifyconfig', 'verify', 'serverstats', 'extraowner'],
   'FUN & ENGAGEMENT': ['starboard', 'reactionrole', 'autopublish'],
 };
@@ -804,6 +806,28 @@ async function statusMonitorTick() {
   }
 }
 setInterval(statusMonitorTick, 5 * 60 * 1000);
+
+// ---------------------------------------------------------------------------
+// LIVE PING STATUS MESSAGE (edits every minute)
+// ---------------------------------------------------------------------------
+const pingStatusMessages = new Map(); // guildId -> { channelId, messageId }
+
+async function pingStatusTick() {
+  for (const [guildId, info] of pingStatusMessages.entries()) {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) continue;
+    const ch = await guild.channels.fetch(info.channelId).catch(() => null);
+    if (!ch) continue;
+    const embed = infoEmbed(`🏓 Bot Ping: **${Math.round(client.ws.ping)}ms**\nLast updated: <t:${Math.floor(Date.now() / 1000)}:R>`, '📡 Live Status');
+    if (info.messageId) {
+      const msg = await ch.messages.fetch(info.messageId).catch(() => null);
+      if (msg) { await msg.edit({ embeds: [embed] }).catch(() => {}); continue; }
+    }
+    const sent = await ch.send({ embeds: [embed] }).catch(() => null);
+    if (sent) info.messageId = sent.id;
+  }
+}
+setInterval(pingStatusTick, 60 * 1000);
 
 // ---------------------------------------------------------------------------
 // REMINDER LOOP
@@ -1767,6 +1791,12 @@ async function handleSlash(interaction) {
       const pages = buildHelpPages();
       return safeReply(interaction, { embeds: [pages[0]], components: [helpButtons(0)] });
     }
+    case 'pingstatus': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      pingStatusMessages.set(guild.id, { channelId: interaction.channel.id, messageId: null });
+      await pingStatusTick();
+      return safeReply(interaction, { embeds: [successEmbed('Live ping status started — it will update every minute in this channel.')] });
+    }
 
     // ---------------- SERVER MANAGEMENT ----------------
     case 'autorole': {
@@ -2162,7 +2192,6 @@ async function handleSelect(interaction) {
   }
 }
 
-
 // ---------------------------------------------------------------------------
 // MODAL HANDLER (reserved for future expansion — no modals require submission
 // handling beyond what buttons/selects already cover in this build)
@@ -2176,6 +2205,7 @@ async function handleModal(interaction) {
 // ---------------------------------------------------------------------------
 process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
 process.on('unhandledRejection', (err) => console.error('Unhandled Rejection:', err));
+
 // ---------------------------------------------------------------------------
 // KEEP-ALIVE WEB SERVER
 // ---------------------------------------------------------------------------
@@ -2183,4 +2213,5 @@ const app = express();
 app.get('/', (req, res) => res.send('Bot is alive.'));
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime(), guilds: client.guilds.cache.size }));
 app.listen(process.env.PORT || 3000, () => console.log(`Web server listening on port ${process.env.PORT || 3000}`));
+
 client.login(process.env.DISCORD_TOKEN);
