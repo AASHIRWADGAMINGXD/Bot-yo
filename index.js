@@ -40,6 +40,8 @@ const {
 // ---------------------------------------------------------------------------
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
+const DB_BAK_FILE = path.join(DATA_DIR, 'db.backup.json');
+const DB_TMP_FILE = path.join(DATA_DIR, 'db.tmp.json');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const DEFAULT_DB = () => ({
@@ -53,7 +55,17 @@ function loadDB() {
   try {
     return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
   } catch (e) {
-    console.error('Failed to parse db.json, reinitializing.', e);
+    console.error('Failed to parse db.json, attempting backup recovery.', e);
+    if (fs.existsSync(DB_BAK_FILE)) {
+      try {
+        const recovered = JSON.parse(fs.readFileSync(DB_BAK_FILE, 'utf8'));
+        console.log('Recovered database from backup file.');
+        fs.writeFileSync(DB_FILE, JSON.stringify(recovered, null, 2));
+        return recovered;
+      } catch (e2) {
+        console.error('Backup file also corrupted, reinitializing.', e2);
+      }
+    }
     const fresh = DEFAULT_DB();
     fs.writeFileSync(DB_FILE, JSON.stringify(fresh, null, 2));
     return fresh;
@@ -62,14 +74,45 @@ function loadDB() {
 
 const db = loadDB();
 let saveTimer = null;
-function saveDB() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    fs.writeFile(DB_FILE, JSON.stringify(db, null, 2), (err) => {
-      if (err) console.error('DB save error:', err);
-    });
-  }, 250);
+let pendingSave = false;
+
+// Atomic, crash-safe save: write to a temp file, keep a rolling backup of the
+// last good save, then atomically rename the temp file into place. This
+// guarantees db.json is never left half-written even if the process dies
+// mid-save, and survives full bot/host restarts.
+function flushDBSync() {
+  try {
+    const json = JSON.stringify(db, null, 2);
+    if (fs.existsSync(DB_FILE)) {
+      fs.copyFileSync(DB_FILE, DB_BAK_FILE);
+    }
+    fs.writeFileSync(DB_TMP_FILE, json);
+    fs.renameSync(DB_TMP_FILE, DB_FILE);
+    pendingSave = false;
+  } catch (err) {
+    console.error('DB save error:', err);
+  }
 }
+
+function saveDB() {
+  pendingSave = true;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushDBSync, 250);
+}
+
+// Safety net: flush unsaved changes every 30s even if nothing triggers a
+// debounced save in the meantime (belt-and-suspenders against edge cases).
+setInterval(() => { if (pendingSave) flushDBSync(); }, 30 * 1000);
+
+// Ensure data is written to disk before the process actually exits, whether
+// from a normal restart/deploy (SIGTERM/SIGINT) or a crash.
+function gracefulExit(signal) {
+  console.log(`Received ${signal}, flushing database before exit...`);
+  flushDBSync();
+  process.exit(0);
+}
+process.on('SIGINT', () => gracefulExit('SIGINT'));
+process.on('SIGTERM', () => gracefulExit('SIGTERM'));
 
 function defaultGuildConfig() {
   return {
@@ -126,6 +169,15 @@ function defaultGuildConfig() {
     statusmonitors: [], // {url, lastStatus}
     reminders: [], // {userId, channelId, remindAt, text, id}
     afk: {}, // userId -> {reason, since}
+    applications: {
+      reviewChannelId: null,
+      resultDMs: true,
+      questions: ['Why do you want to join the team?', 'Relevant experience?', 'How old are you?', 'Timezone?'],
+      panels: {}, // panelId -> {channelId, messageId, title, description, banner}
+      nextPanelId: 1,
+      pendingByUser: {}, // userId -> true while an application is open, to prevent duplicate applications
+      submissions: [], // {userId, tag, answers:[], status: 'pending'|'accepted'|'denied', reviewedBy, ts}
+    },
   };
 }
 
@@ -239,6 +291,14 @@ function requireLevel(interaction, gconf, min) {
   return lvl >= min;
 }
 
+// Super Admins (and the server owner) can run every command in this bot,
+// regardless of their raw Discord permissions — used to bypass permission
+// checks that are written against Discord permission flags rather than
+// bot permission levels.
+function isBotSuperAdmin(interaction, gconf) {
+  return getLevel(interaction.guild, gconf, interaction.member) >= LEVEL.SUPER_ADMIN;
+}
+
 // bot hierarchy check: can the bot act on target member?
 function botCanActOn(guild, targetMember) {
   const me = guild.members.me;
@@ -247,8 +307,9 @@ function botCanActOn(guild, targetMember) {
   return me.roles.highest.comparePositionTo(targetMember.roles.highest) > 0;
 }
 
-function actorOutranks(actorMember, targetMember, guild) {
+function actorOutranks(actorMember, targetMember, guild, gconf) {
   if (actorMember.id === guild.ownerId) return true;
+  if (gconf && (gconf.superAdmins.includes(actorMember.id) || gconf.extraOwners.includes(actorMember.id))) return true;
   return actorMember.roles.highest.comparePositionTo(targetMember.roles.highest) > 0;
 }
 
@@ -528,6 +589,18 @@ cmd(new SlashCommandBuilder().setName('autopublish').setDescription('Auto-publis
   .addSubcommand(s => s.setName('setup').setDescription('Add an announcement channel to auto-publish').addChannelOption(o => o.setName('channel').setDescription('Announcement channel').setRequired(true)))
   .addSubcommand(s => s.setName('remove').setDescription('Remove an auto-publish channel').addChannelOption(o => o.setName('channel').setDescription('Channel').setRequired(true))));
 
+cmd(new SlashCommandBuilder().setName('application').setDescription('Application system (staff/member applications)')
+  .addSubcommand(s => s.setName('setup').setDescription('Configure where applications are reviewed')
+    .addChannelOption(o => o.setName('reviewchannel').setDescription('Channel where submitted applications are posted').setRequired(true)))
+  .addSubcommand(s => s.setName('panel').setDescription('Post an application panel with an Apply button')
+    .addStringOption(o => o.setName('title').setDescription('Panel title').setRequired(true))
+    .addStringOption(o => o.setName('description').setDescription('Panel description').setRequired(true))
+    .addStringOption(o => o.setName('banner').setDescription('Banner image URL')))
+  .addSubcommand(s => s.setName('addquestion').setDescription('Add a question (max 5 total, modal limit)').addStringOption(o => o.setName('question').setDescription('Question text').setRequired(true)))
+  .addSubcommand(s => s.setName('removequestion').setDescription('Remove a question by number').addIntegerOption(o => o.setName('number').setDescription('Question number (from /application listquestions)').setRequired(true)))
+  .addSubcommand(s => s.setName('listquestions').setDescription('List configured application questions'))
+  .addSubcommand(s => s.setName('list').setDescription('List recent applications').addStringOption(o => o.setName('status').setDescription('Filter by status').addChoices({ name: 'pending', value: 'pending' }, { name: 'accepted', value: 'accepted' }, { name: 'denied', value: 'denied' }))));
+
 // ---------------------------------------------------------------------------
 // COMMAND METADATA FOR /help (category + min level)
 // ---------------------------------------------------------------------------
@@ -541,7 +614,7 @@ const HELP_CATEGORIES = {
   'INVITES': ['invites', 'inviteleaderboard', 'resetinvites'],
   'UTILITY & TOOLS': ['customcommand', 'giveaway', 'statusmonitor', 'weather', 'qrcode', 'remindme', 'poll', 'afk'],
   'INFORMATION': ['serverinfo', 'userinfo', 'roleinfo', 'avatar', 'banner', 'membercount', 'ping', 'stats', 'help', 'pingstatus'],
-  'SERVER MANAGEMENT': ['autorole', 'stickyroles', 'addrole', 'removerole', 'verifyconfig', 'verify', 'serverstats', 'extraowner'],
+  'SERVER MANAGEMENT': ['autorole', 'stickyroles', 'addrole', 'removerole', 'verifyconfig', 'verify', 'serverstats', 'extraowner', 'application'],
   'FUN & ENGAGEMENT': ['starboard', 'reactionrole', 'autopublish'],
 };
 
@@ -861,6 +934,7 @@ function botconfigMenu() {
       { label: 'Auto Publish', value: 'autopublish', emoji: '📢' },
       { label: 'Server Statistics', value: 'serverstats', emoji: '📊' },
       { label: 'Logging', value: 'logging', emoji: '📝' },
+      { label: 'Applications', value: 'applications', emoji: '📝' },
     ),
   );
   return row;
@@ -887,6 +961,11 @@ function configSummaryEmbed(gconf, section, guildId) {
     case 'autopublish': e.setDescription(`Channels: ${gconf.autopublish.channels.map(c => `<#${c}>`).join(', ') || 'none'}`); break;
     case 'serverstats': e.setDescription(`Channels configured: ${Object.keys(gconf.serverstats.channels).length}. Use \`/serverstats setup|remove\`.`); break;
     case 'logging': e.setDescription(`Log channel: ${gconf.logging.channelId ? `<#${gconf.logging.channelId}>` : 'not set'}`); break;
+    case 'applications': {
+      const pending = gconf.applications.submissions.filter(s => s.status === 'pending').length;
+      e.setDescription(`Review channel: ${gconf.applications.reviewChannelId ? `<#${gconf.applications.reviewChannelId}>` : 'not set'}\nQuestions: ${gconf.applications.questions.length}\nPending: ${pending}\nUse \`/application\` subcommands to configure.`);
+      break;
+    }
     default: e.setDescription('Unknown section.');
   }
   return e;
@@ -1545,7 +1624,7 @@ async function handleSlash(interaction) {
       }
 
       if (targetMember) {
-        if (!actorOutranks(interaction.member, targetMember, guild) && interaction.member.id !== guild.ownerId) {
+        if (!actorOutranks(interaction.member, targetMember, guild, gconf) && !isBotSuperAdmin(interaction, gconf)) {
           return safeReply(interaction, { embeds: [errorEmbed('You cannot moderate someone with an equal or higher role.')], ephemeral: true });
         }
         if (commandName !== 'warn' && !botCanActOn(guild, targetMember)) {
@@ -1607,7 +1686,7 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [successEmbed(`Cleared warnings for ${user}.`)] });
     }
     case 'purge': {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Messages permission.')], ephemeral: true });
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Messages permission.')], ephemeral: true });
       const amount = interaction.options.getInteger('amount');
       await interaction.deferReply({ ephemeral: true });
       const deleted = await interaction.channel.bulkDelete(amount, true).catch(() => null);
@@ -1617,17 +1696,17 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [embed] });
     }
     case 'lock': {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
       await interaction.channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: false });
       return safeReply(interaction, { embeds: [successEmbed('Channel locked.')] });
     }
     case 'unlock': {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
       await interaction.channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: null });
       return safeReply(interaction, { embeds: [successEmbed('Channel unlocked.')] });
     }
     case 'slowmode': {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageChannels) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Channels permission.')], ephemeral: true });
       const secs = interaction.options.getInteger('seconds');
       await interaction.channel.setRateLimitPerUser(secs);
       return safeReply(interaction, { embeds: [successEmbed(`Slowmode set to ${secs}s.`)] });
@@ -1981,7 +2060,7 @@ async function handleSlash(interaction) {
       return safeReply(interaction, { embeds: [successEmbed(`Sticky roles ${sub}d.`)] });
     }
     case 'addrole': case 'removerole': {
-      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageRoles)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Roles permission.')], ephemeral: true });
+      if (!interaction.member.permissions.has(PermissionFlagsBits.ManageRoles) && !isBotSuperAdmin(interaction, gconf)) return safeReply(interaction, { embeds: [errorEmbed('Requires Manage Roles permission.')], ephemeral: true });
       const user = interaction.options.getUser('user');
       const role = interaction.options.getRole('role');
       const member = await guild.members.fetch(user.id).catch(() => null);
@@ -2080,6 +2159,57 @@ async function handleSlash(interaction) {
       }
       saveDB();
       return safeReply(interaction, { embeds: [successEmbed(`Auto-publish ${sub === 'setup' ? 'enabled' : 'disabled'} for ${channel}.`)] });
+    }
+
+    // ---------------- APPLICATION SYSTEM ----------------
+    case 'application': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'setup') {
+        gconf.applications.reviewChannelId = interaction.options.getChannel('reviewchannel').id;
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed('Applications will now be reviewed in that channel.')] });
+      }
+      if (sub === 'panel') {
+        if (!gconf.applications.reviewChannelId) return safeReply(interaction, { embeds: [errorEmbed('Run `/application setup` first.')], ephemeral: true });
+        const title = interaction.options.getString('title');
+        const description = interaction.options.getString('description');
+        const banner = interaction.options.getString('banner');
+        const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(title).setDescription(description).setTimestamp();
+        if (banner) embed.setImage(banner);
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('application_apply').setLabel('📝 Apply').setStyle(ButtonStyle.Success));
+        const msg = await interaction.channel.send({ embeds: [embed], components: [row] });
+        const panelId = gconf.applications.nextPanelId++;
+        gconf.applications.panels[panelId] = { channelId: interaction.channel.id, messageId: msg.id, title, description, banner: banner || null };
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(`Application panel #${panelId} posted.`)], ephemeral: true });
+      }
+      if (sub === 'addquestion') {
+        if (gconf.applications.questions.length >= 5) return safeReply(interaction, { embeds: [errorEmbed('Maximum of 5 questions (Discord modal limit).')], ephemeral: true });
+        gconf.applications.questions.push(interaction.options.getString('question'));
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed('Question added.')] });
+      }
+      if (sub === 'removequestion') {
+        const num = interaction.options.getInteger('number');
+        if (num < 1 || num > gconf.applications.questions.length) return safeReply(interaction, { embeds: [errorEmbed('Invalid question number.')], ephemeral: true });
+        gconf.applications.questions.splice(num - 1, 1);
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed('Question removed.')] });
+      }
+      if (sub === 'listquestions') {
+        const desc = gconf.applications.questions.length ? gconf.applications.questions.map((q, i) => `**${i + 1}.** ${q}`).join('\n') : 'No questions configured (a default set will be used).';
+        return safeReply(interaction, { embeds: [infoEmbed(desc, 'Application Questions')] });
+      }
+      if (sub === 'list') {
+        const status = interaction.options.getString('status');
+        let subs = gconf.applications.submissions;
+        if (status) subs = subs.filter(s => s.status === status);
+        subs = subs.slice(-10).reverse();
+        const desc = subs.length ? subs.map(s => `<@${s.userId}> — **${s.status}** — <t:${Math.floor(s.ts / 1000)}:R>`).join('\n') : 'No applications found.';
+        return safeReply(interaction, { embeds: [infoEmbed(desc, 'Recent Applications')] });
+      }
+      break;
     }
 
     default:
@@ -2344,6 +2474,48 @@ async function handleButton(interaction) {
     return safeReply(interaction, { embeds: [successEmbed('You entered the giveaway! Click again to leave.')], ephemeral: true });
   }
 
+  if (id === 'application_apply') {
+    if (gconf.applications.pendingByUser[interaction.user.id]) {
+      return safeReply(interaction, { embeds: [errorEmbed('You already have a pending application. Please wait for a response.')], ephemeral: true });
+    }
+    const questions = gconf.applications.questions.length ? gconf.applications.questions : ['Why do you want to join?', 'Relevant experience?'];
+    const modal = new ModalBuilder().setCustomId('application_modal').setTitle('Application Form');
+    questions.slice(0, 5).forEach((q, i) => {
+      modal.addComponents(new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId(`app_q${i}`).setLabel(q.slice(0, 45)).setStyle(TextInputStyle.Paragraph).setRequired(true).setMaxLength(1000),
+      ));
+    });
+    return interaction.showModal(modal);
+  }
+
+  if (id.startsWith('application_accept_') || id.startsWith('application_deny_')) {
+    if (!requireLevel(interaction, gconf, LEVEL.MOD)) return safeReply(interaction, { embeds: [errorEmbed('Requires Moderator or higher.')], ephemeral: true });
+    const accepted = id.startsWith('application_accept_');
+    const userId = id.replace(accepted ? 'application_accept_' : 'application_deny_', '');
+    const record = gconf.applications.submissions.find(s => s.userId === userId && s.status === 'pending');
+    if (record) { record.status = accepted ? 'accepted' : 'denied'; record.reviewedBy = interaction.user.id; }
+    delete gconf.applications.pendingByUser[userId];
+    saveDB();
+
+    const resultEmbed = accepted
+      ? successEmbed(`Your application in **${interaction.guild.name}** was accepted!`, '✅ Application Accepted')
+      : errorEmbed(`Your application in **${interaction.guild.name}** was not accepted at this time.`, '❌ Application Denied');
+    if (gconf.applications.resultDMs) {
+      const user = await client.users.fetch(userId).catch(() => null);
+      if (user) await tryDM(user, resultEmbed);
+    }
+
+    const original = interaction.message;
+    const updatedEmbeds = original.embeds.map(e => EmbedBuilder.from(e));
+    if (updatedEmbeds[0]) updatedEmbeds[0].addFields({ name: 'Decision', value: `${accepted ? '✅ Accepted' : '❌ Denied'} by ${interaction.user}` });
+    const disabledRow = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('application_accept_done').setLabel('Accept').setStyle(ButtonStyle.Success).setDisabled(true),
+      new ButtonBuilder().setCustomId('application_deny_done').setLabel('Deny').setStyle(ButtonStyle.Danger).setDisabled(true),
+    );
+    await interaction.update({ embeds: updatedEmbeds, components: [disabledRow] }).catch(() => {});
+    return;
+  }
+
   if (id.startsWith('botconfig_')) return; // handled in select
 }
 
@@ -2363,18 +2535,43 @@ async function handleSelect(interaction) {
 }
 
 // ---------------------------------------------------------------------------
-// MODAL HANDLER (reserved for future expansion — no modals require submission
-// handling beyond what buttons/selects already cover in this build)
+// MODAL HANDLER
 // ---------------------------------------------------------------------------
 async function handleModal(interaction) {
+  const gconf = getGuild(interaction.guild.id);
+
+  if (interaction.customId === 'application_modal') {
+    const questions = gconf.applications.questions.length ? gconf.applications.questions : ['Why do you want to join?', 'Relevant experience?'];
+    const answers = questions.slice(0, 5).map((q, i) => ({ q, a: interaction.fields.getTextInputValue(`app_q${i}`) }));
+
+    gconf.applications.pendingByUser[interaction.user.id] = true;
+    gconf.applications.submissions.push({ userId: interaction.user.id, tag: interaction.user.tag, answers, status: 'pending', reviewedBy: null, ts: Date.now() });
+    saveDB();
+
+    const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(`📝 New Application — ${interaction.user.tag}`)
+      .setThumbnail(interaction.user.displayAvatarURL())
+      .addFields(answers.map(a => ({ name: a.q.slice(0, 256), value: a.a.slice(0, 1024) || 'No answer' })))
+      .setFooter({ text: `User ID: ${interaction.user.id}` })
+      .setTimestamp();
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId(`application_accept_${interaction.user.id}`).setLabel('Accept').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId(`application_deny_${interaction.user.id}`).setLabel('Deny').setStyle(ButtonStyle.Danger),
+    );
+
+    const reviewCh = gconf.applications.reviewChannelId ? await interaction.guild.channels.fetch(gconf.applications.reviewChannelId).catch(() => null) : null;
+    if (reviewCh) await reviewCh.send({ embeds: [embed], components: [row] }).catch(() => {});
+
+    return safeReply(interaction, { embeds: [successEmbed('Your application has been submitted for review!')], ephemeral: true });
+  }
+
   return safeReply(interaction, { embeds: [infoEmbed('Received.')], ephemeral: true });
 }
 
 // ---------------------------------------------------------------------------
 // GLOBAL ERROR HANDLING
 // ---------------------------------------------------------------------------
-process.on('uncaughtException', (err) => console.error('Uncaught Exception:', err));
-process.on('unhandledRejection', (err) => console.error('Unhandled Rejection:', err));
+process.on('uncaughtException', (err) => { console.error('Uncaught Exception:', err); flushDBSync(); });
+process.on('unhandledRejection', (err) => { console.error('Unhandled Rejection:', err); flushDBSync(); });
 
 // ---------------------------------------------------------------------------
 // KEEP-ALIVE WEB SERVER
