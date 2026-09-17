@@ -1,3 +1,4 @@
+
 /**
  * ALL-IN-ONE DISCORD BOT — single file (index.js)
  * Discord.js v14
@@ -268,7 +269,16 @@ const startTime = Date.now();
 // ---------------------------------------------------------------------------
 const LEVEL = { USER: 1, MOD: 2, ADMIN: 3, EXTRA_OWNER: 4, SUPER_ADMIN: 5, OWNER: 6 };
 
+// Bot Owner(s) — set via BOT_OWNER_IDS in .env (comma-separated Discord user
+// IDs). Bot Owners can run any command on any server, bypassing every
+// per-guild permission check, same as OWNER level everywhere.
+const BOT_OWNER_IDS = (process.env.BOT_OWNER_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
+function isBotOwner(userId) {
+  return BOT_OWNER_IDS.includes(userId);
+}
+
 function isProtected(guild, gconf, userId) {
+  if (isBotOwner(userId)) return true;
   if (userId === guild.ownerId) return true;
   if (gconf.extraOwners.includes(userId)) return true;
   if (gconf.superAdmins.includes(userId)) return true;
@@ -278,10 +288,13 @@ function isProtected(guild, gconf, userId) {
 
 function getLevel(guild, gconf, member) {
   if (!member) return LEVEL.USER;
+  if (isBotOwner(member.id)) return LEVEL.OWNER;
   if (member.id === guild.ownerId) return LEVEL.OWNER;
   if (gconf.superAdmins.includes(member.id)) return LEVEL.SUPER_ADMIN;
   if (gconf.extraOwners.includes(member.id)) return LEVEL.EXTRA_OWNER;
-  if (member.permissions?.has(PermissionFlagsBits.Administrator)) return LEVEL.ADMIN;
+  // Anyone holding real Discord Administrator permission (including via an
+  // "Administrator" role) is treated as a bot Super Admin as well.
+  if (member.permissions?.has(PermissionFlagsBits.Administrator)) return LEVEL.SUPER_ADMIN;
   if (member.permissions?.has(PermissionFlagsBits.ModerateMembers) || member.permissions?.has(PermissionFlagsBits.KickMembers)) return LEVEL.MOD;
   return LEVEL.USER;
 }
@@ -1303,10 +1316,107 @@ client.on('messageCreate', async (message) => {
     }
   }
 
+  // AI chat — triggered by @mentioning the bot
+  if (message.mentions.has(client.user)) {
+    await handleAIChat(message).catch(e => console.error('AI chat error:', e));
+    return;
+  }
+
   const wordBlocked = await handleBadWords(message).catch(e => { console.error('badwords error:', e); return false; });
   if (wordBlocked) return; // message already deleted + actioned; skip further spam checks on it
   await handleAntispam(message).catch(e => console.error('antispam error:', e));
 });
+
+// ---------------------------------------------------------------------------
+// AI CHAT (OpenRouter) — @mention the bot to chat, or ask it to run a
+// basic moderation action like "@bot timeout @user 10m being rude".
+// ---------------------------------------------------------------------------
+async function callOpenRouter(messages) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return { error: 'AI chat is not configured (missing OPENROUTER_API_KEY).' };
+  const model = process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini';
+  try {
+    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model, messages, temperature: 0.4 }),
+    });
+    const data = await res.json();
+    if (!res.ok) return { error: data?.error?.message || 'AI request failed.' };
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content) return { error: 'AI returned an empty response.' };
+    return { content };
+  } catch (e) {
+    return { error: 'Could not reach the AI service.' };
+  }
+}
+
+async function handleAIChat(message) {
+  const gconf = getGuild(message.guild.id);
+  const cleaned = message.content.replace(/<@!?\d+>/g, '').trim();
+  const targetUser = message.mentions.users.find(u => u.id !== client.user.id);
+
+  const systemPrompt = [
+    'You are the AI assistant built into a Discord moderation bot called VantixNodes.',
+    'You can chat normally, and you can also perform ONE basic moderation action: timing out a member.',
+    'If — and only if — the user is clearly asking you to time out / mute a specific mentioned member, reply with ONLY raw JSON in this exact shape and nothing else:',
+    '{"action":"timeout","targetId":"<the mentioned user\'s numeric ID>","minutes":<integer minutes>,"reason":"<short reason>"}',
+    'Minutes should come from what the user wrote (e.g. "10m" -> 10, "1h" -> 60); default to 10 if unclear.',
+    'For every other message, reply normally in plain, friendly text — never wrap normal replies in JSON.',
+    targetUser ? `The message mentions this user ID (besides you): ${targetUser.id}` : 'No other user was mentioned in this message.',
+  ].join('\n');
+
+  const result = await callOpenRouter([
+    { role: 'system', content: systemPrompt },
+    { role: 'user', content: cleaned || 'Hello' },
+  ]);
+
+  if (result.error) {
+    return message.reply({ embeds: [errorEmbed(result.error)] }).catch(() => {});
+  }
+
+  // Try to parse a timeout action out of the AI's response.
+  let parsed = null;
+  try { parsed = JSON.parse(result.content.trim()); } catch { /* not JSON, treat as normal chat */ }
+
+  if (parsed && parsed.action === 'timeout' && parsed.targetId) {
+    const targetId = parsed.targetId;
+    const minutes = Math.max(1, Math.min(parseInt(parsed.minutes, 10) || 10, 40320)); // cap at 28 days
+    const reason = (parsed.reason || 'No reason provided').slice(0, 400);
+
+    // Enforce the same permission/hierarchy/protection rules as /timeout.
+    if (!requireLevel({ guild: message.guild, member: message.member }, gconf, LEVEL.MOD) && !message.member.permissions.has(PermissionFlagsBits.ModerateMembers)) {
+      return message.reply({ embeds: [errorEmbed('You do not have permission to time out members.')] }).catch(() => {});
+    }
+    if (isProtected(message.guild, gconf, targetId)) {
+      return message.reply({ embeds: [warnEmbed('That user is protected and cannot be moderated.')] }).catch(() => {});
+    }
+    const targetMember = await message.guild.members.fetch(targetId).catch(() => null);
+    if (!targetMember) {
+      return message.reply({ embeds: [errorEmbed('I could not find that member in this server.')] }).catch(() => {});
+    }
+    if (!actorOutranks(message.member, targetMember, message.guild, gconf) && !isBotOwner(message.author.id)) {
+      return message.reply({ embeds: [errorEmbed('You cannot moderate someone with an equal or higher role.')] }).catch(() => {});
+    }
+    if (!botCanActOn(message.guild, targetMember)) {
+      return message.reply({ embeds: [errorEmbed("I don't have a high enough role to do that.")] }).catch(() => {});
+    }
+
+    await targetMember.timeout(minutes * 60 * 1000, reason).catch(() => {});
+    await tryDM(targetMember.user, warnEmbed(`You were timed out in **${message.guild.name}** for ${minutes}m: ${reason}`));
+    const embed = successEmbed(`${targetMember} has been timed out for ${minutes}m.\nReason: ${reason}`, '🤖 AI Moderation Action');
+    await logEvent(message.guild, gconf, embed);
+    await sendVantixNotice(message.guild, gconf, { userId: targetId, type: 'AI Chat', action: `Timeout (${minutes}m)`, reason }, message.channel);
+    return message.reply({ embeds: [embed] }).catch(() => {});
+  }
+
+  // Plain conversational reply.
+  const replyText = (parsed ? result.content : result.content).slice(0, 1900);
+  return message.reply({ content: replyText }).catch(() => {});
+}
 
 // ---------------------------------------------------------------------------
 // EVENT: MESSAGE REACTION ADD (starboard, reaction roles)
@@ -1457,7 +1567,7 @@ async function handleSlash(interaction) {
   switch (commandName) {
     // ---------------- SUPER ADMIN ----------------
     case 'superadmin': {
-      if (interaction.member.id !== guild.ownerId && !gconf.superAdmins.includes(interaction.member.id)) {
+      if (!isBotOwner(interaction.member.id) && interaction.member.id !== guild.ownerId && !gconf.superAdmins.includes(interaction.member.id)) {
         return safeReply(interaction, { embeds: [errorEmbed('Only the server owner or existing super admins can manage this.')], ephemeral: true });
       }
       const sub = interaction.options.getSubcommand();
