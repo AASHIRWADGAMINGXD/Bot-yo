@@ -1,4 +1,3 @@
-
 /**
  * ALL-IN-ONE DISCORD BOT — single file (index.js)
  * Discord.js v14
@@ -170,6 +169,10 @@ function defaultGuildConfig() {
     statusmonitors: [], // {url, lastStatus}
     reminders: [], // {userId, channelId, remindAt, text, id}
     afk: {}, // userId -> {reason, since}
+    ai: {
+      customPrompt: '', // Super Admin-editable addition to the AI's system prompt
+      memory: {}, // userId -> [{role, content}] rolling short-term memory
+    },
     applications: {
       reviewChannelId: null,
       resultDMs: true,
@@ -614,11 +617,25 @@ cmd(new SlashCommandBuilder().setName('application').setDescription('Application
   .addSubcommand(s => s.setName('listquestions').setDescription('List configured application questions'))
   .addSubcommand(s => s.setName('list').setDescription('List recent applications').addStringOption(o => o.setName('status').setDescription('Filter by status').addChoices({ name: 'pending', value: 'pending' }, { name: 'accepted', value: 'accepted' }, { name: 'denied', value: 'denied' }))));
 
+cmd(new SlashCommandBuilder().setName('aiconfig').setDescription('Configure the AI (Jarvis) system — Super Admin only')
+  .addSubcommand(s => s.setName('setprompt').setDescription('Set a custom addition to the AI system prompt').addStringOption(o => o.setName('prompt').setDescription('Custom instructions for the AI').setRequired(true)))
+  .addSubcommand(s => s.setName('viewprompt').setDescription('View the current custom AI prompt'))
+  .addSubcommand(s => s.setName('resetprompt').setDescription('Reset the AI prompt to default'))
+  .addSubcommand(s => s.setName('clearmemory').setDescription('Clear the AI\'s remembered conversation history')
+    .addUserOption(o => o.setName('user').setDescription('Clear memory for a specific user only (omit to clear everyone)'))));
+
+cmd(new SlashCommandBuilder().setName('announcement').setDescription('Send a formatted announcement')
+  .addChannelOption(o => o.setName('channel').setDescription('Channel to post in').setRequired(true))
+  .addStringOption(o => o.setName('title').setDescription('Announcement title').setRequired(true))
+  .addStringOption(o => o.setName('message').setDescription('Announcement content').setRequired(true))
+  .addStringOption(o => o.setName('ping').setDescription('Who to ping').addChoices({ name: 'everyone', value: 'everyone' }, { name: 'here', value: 'here' }, { name: 'none', value: 'none' }))
+  .addStringOption(o => o.setName('banner').setDescription('Banner image URL')));
+
 // ---------------------------------------------------------------------------
 // COMMAND METADATA FOR /help (category + min level)
 // ---------------------------------------------------------------------------
 const HELP_CATEGORIES = {
-  'SUPER ADMIN': ['superadmin', 'botconfig'],
+  'SUPER ADMIN': ['superadmin', 'botconfig', 'aiconfig'],
   'SECURITY': ['antinuke', 'antispam', 'badwords'],
   'MODERATION': ['ban', 'kick', 'timeout', 'warn', 'warnings', 'clearwarns', 'purge', 'lock', 'unlock', 'slowmode'],
   'TICKETS': ['ticket'],
@@ -627,7 +644,7 @@ const HELP_CATEGORIES = {
   'INVITES': ['invites', 'inviteleaderboard', 'resetinvites'],
   'UTILITY & TOOLS': ['customcommand', 'giveaway', 'statusmonitor', 'weather', 'qrcode', 'remindme', 'poll', 'afk'],
   'INFORMATION': ['serverinfo', 'userinfo', 'roleinfo', 'avatar', 'banner', 'membercount', 'ping', 'stats', 'help', 'pingstatus'],
-  'SERVER MANAGEMENT': ['autorole', 'stickyroles', 'addrole', 'removerole', 'verifyconfig', 'verify', 'serverstats', 'extraowner', 'application'],
+  'SERVER MANAGEMENT': ['autorole', 'stickyroles', 'addrole', 'removerole', 'verifyconfig', 'verify', 'serverstats', 'extraowner', 'application', 'announcement'],
   'FUN & ENGAGEMENT': ['starboard', 'reactionrole', 'autopublish'],
 };
 
@@ -1328,8 +1345,11 @@ client.on('messageCreate', async (message) => {
 });
 
 // ---------------------------------------------------------------------------
-// AI CHAT (OpenRouter) — @mention the bot to chat, or ask it to run a
-// basic moderation action like "@bot timeout @user 10m being rude".
+// AI CHAT (OpenRouter) — "Jarvis": @mention the bot to chat, or ask it to
+// run basic server/bot actions in natural language (timeout, kick, ban,
+// warn, purge, lock/unlock, slowmode, add/remove role, announcements,
+// and remembering things about you). Super Admins can customize its
+// system prompt via /aiconfig, and it keeps short-term memory per user.
 // ---------------------------------------------------------------------------
 async function callOpenRouter(messages) {
   const apiKey = process.env.OPENROUTER_API_KEY;
@@ -1354,20 +1374,64 @@ async function callOpenRouter(messages) {
   }
 }
 
+function aiRememberFact(gconf, userId, fact) {
+  if (!gconf.ai.memory[userId]) gconf.ai.memory[userId] = [];
+  gconf.ai.memory[userId].push({ role: 'fact', content: fact, ts: Date.now() });
+  gconf.ai.memory[userId] = gconf.ai.memory[userId].slice(-20);
+  saveDB();
+}
+
+function aiRememberExchange(gconf, userId, userText, assistantText) {
+  if (!gconf.ai.memory[userId]) gconf.ai.memory[userId] = [];
+  gconf.ai.memory[userId].push({ role: 'user', content: userText, ts: Date.now() });
+  gconf.ai.memory[userId].push({ role: 'assistant', content: assistantText, ts: Date.now() });
+  gconf.ai.memory[userId] = gconf.ai.memory[userId].slice(-20);
+  saveDB();
+}
+
+// Fake "interaction-like" object so we can reuse requireLevel()/getLevel() helpers.
+function fakeInteraction(message) {
+  return { guild: message.guild, member: message.member };
+}
+
 async function handleAIChat(message) {
   const gconf = getGuild(message.guild.id);
   const cleaned = message.content.replace(/<@!?\d+>/g, '').trim();
   const targetUser = message.mentions.users.find(u => u.id !== client.user.id);
 
-  const systemPrompt = [
-    'You are the AI assistant built into a Discord moderation bot called VantixNodes.',
-    'You can chat normally, and you can also perform ONE basic moderation action: timing out a member.',
-    'If — and only if — the user is clearly asking you to time out / mute a specific mentioned member, reply with ONLY raw JSON in this exact shape and nothing else:',
-    '{"action":"timeout","targetId":"<the mentioned user\'s numeric ID>","minutes":<integer minutes>,"reason":"<short reason>"}',
-    'Minutes should come from what the user wrote (e.g. "10m" -> 10, "1h" -> 60); default to 10 if unclear.',
-    'For every other message, reply normally in plain, friendly text — never wrap normal replies in JSON.',
+  const basePrompt = [
+    'You are Jarvis, the AI assistant built into a Discord bot called VantixNodes.',
+    'You can chat normally like a helpful assistant, AND you can perform actions in this Discord server on the user\'s behalf when clearly asked.',
+    'Available actions (reply with ONLY raw JSON, nothing else, when performing one):',
+    '{"action":"timeout","targetId":"<user id>","minutes":<int>,"reason":"<text>"}',
+    '{"action":"kick","targetId":"<user id>","reason":"<text>"}',
+    '{"action":"ban","targetId":"<user id>","reason":"<text>"}',
+    '{"action":"warn","targetId":"<user id>","reason":"<text>"}',
+    '{"action":"purge","amount":<int 1-100>}',
+    '{"action":"lock"}',
+    '{"action":"unlock"}',
+    '{"action":"slowmode","seconds":<int 0-21600>}',
+    '{"action":"addrole","targetId":"<user id>","roleId":"<role id>"}',
+    '{"action":"removerole","targetId":"<user id>","roleId":"<role id>"}',
+    '{"action":"announcement","channelId":"<channel id, default to this channel if unspecified>","title":"<text>","message":"<text>"}',
+    '{"action":"remember","fact":"<short fact about the user to remember for later, in your own words>"}',
+    'Only use "addrole"/"removerole" if a role was clearly identified (e.g. mentioned as <@&ID> or you were told its ID) — never guess a role ID.',
+    'Minutes/seconds should come from what the user wrote (e.g. "10m" -> 10, "1h" -> 60); pick a sensible default if unclear.',
+    'For every other message — normal conversation, questions, or when no action clearly applies — reply normally in plain, friendly text and NEVER wrap it in JSON.',
     targetUser ? `The message mentions this user ID (besides you): ${targetUser.id}` : 'No other user was mentioned in this message.',
+    `This channel's ID is ${message.channel.id}.`,
   ].join('\n');
+
+  const customPrompt = gconf.ai.customPrompt ? `\n\nAdditional instructions set by this server's Super Admins (follow these too):\n${gconf.ai.customPrompt}` : '';
+
+  const memory = gconf.ai.memory[message.author.id] || [];
+  const memoryLines = memory.slice(-10).map(m => {
+    if (m.role === 'fact') return `[Remembered fact about this user]: ${m.content}`;
+    return `[${m.role === 'user' ? 'User previously said' : 'You previously replied'}]: ${m.content}`;
+  }).join('\n');
+  const memoryBlock = memoryLines ? `\n\nWhat you remember about this user from earlier conversations:\n${memoryLines}` : '';
+
+  const systemPrompt = basePrompt + customPrompt + memoryBlock;
 
   const result = await callOpenRouter([
     { role: 'system', content: systemPrompt },
@@ -1378,44 +1442,146 @@ async function handleAIChat(message) {
     return message.reply({ embeds: [errorEmbed(result.error)] }).catch(() => {});
   }
 
-  // Try to parse a timeout action out of the AI's response.
   let parsed = null;
   try { parsed = JSON.parse(result.content.trim()); } catch { /* not JSON, treat as normal chat */ }
 
-  if (parsed && parsed.action === 'timeout' && parsed.targetId) {
-    const targetId = parsed.targetId;
-    const minutes = Math.max(1, Math.min(parseInt(parsed.minutes, 10) || 10, 40320)); // cap at 28 days
-    const reason = (parsed.reason || 'No reason provided').slice(0, 400);
-
-    // Enforce the same permission/hierarchy/protection rules as /timeout.
-    if (!requireLevel({ guild: message.guild, member: message.member }, gconf, LEVEL.MOD) && !message.member.permissions.has(PermissionFlagsBits.ModerateMembers)) {
-      return message.reply({ embeds: [errorEmbed('You do not have permission to time out members.')] }).catch(() => {});
-    }
-    if (isProtected(message.guild, gconf, targetId)) {
-      return message.reply({ embeds: [warnEmbed('That user is protected and cannot be moderated.')] }).catch(() => {});
-    }
-    const targetMember = await message.guild.members.fetch(targetId).catch(() => null);
-    if (!targetMember) {
-      return message.reply({ embeds: [errorEmbed('I could not find that member in this server.')] }).catch(() => {});
-    }
-    if (!actorOutranks(message.member, targetMember, message.guild, gconf) && !isBotOwner(message.author.id)) {
-      return message.reply({ embeds: [errorEmbed('You cannot moderate someone with an equal or higher role.')] }).catch(() => {});
-    }
-    if (!botCanActOn(message.guild, targetMember)) {
-      return message.reply({ embeds: [errorEmbed("I don't have a high enough role to do that.")] }).catch(() => {});
-    }
-
-    await targetMember.timeout(minutes * 60 * 1000, reason).catch(() => {});
-    await tryDM(targetMember.user, warnEmbed(`You were timed out in **${message.guild.name}** for ${minutes}m: ${reason}`));
-    const embed = successEmbed(`${targetMember} has been timed out for ${minutes}m.\nReason: ${reason}`, '🤖 AI Moderation Action');
-    await logEvent(message.guild, gconf, embed);
-    await sendVantixNotice(message.guild, gconf, { userId: targetId, type: 'AI Chat', action: `Timeout (${minutes}m)`, reason }, message.channel);
-    return message.reply({ embeds: [embed] }).catch(() => {});
+  if (parsed && parsed.action) {
+    const summary = await executeAIAction(message, gconf, parsed);
+    aiRememberExchange(gconf, message.author.id, cleaned, summary || `(performed action: ${parsed.action})`);
+    return;
   }
 
   // Plain conversational reply.
-  const replyText = (parsed ? result.content : result.content).slice(0, 1900);
+  const replyText = result.content.slice(0, 1900);
+  aiRememberExchange(gconf, message.author.id, cleaned, replyText);
   return message.reply({ content: replyText }).catch(() => {});
+}
+
+// Executes one AI-requested action, enforcing the same permission,
+// hierarchy, and protected-user rules as the equivalent slash command.
+async function executeAIAction(message, gconf, parsed) {
+  const guild = message.guild;
+  const fakeInt = fakeInteraction(message);
+  const hasPerm = (flag) => message.member.permissions.has(flag);
+  const bail = async (text) => { await message.reply({ embeds: [errorEmbed(text)] }).catch(() => {}); return text; };
+
+  switch (parsed.action) {
+    case 'timeout':
+    case 'kick':
+    case 'ban':
+    case 'warn': {
+      const targetId = parsed.targetId;
+      if (!targetId) return bail('The AI did not identify a valid target user.');
+      const permMap = { timeout: PermissionFlagsBits.ModerateMembers, kick: PermissionFlagsBits.KickMembers, ban: PermissionFlagsBits.BanMembers, warn: PermissionFlagsBits.ModerateMembers };
+      if (!hasPerm(permMap[parsed.action]) && !requireLevel(fakeInt, gconf, LEVEL.MOD)) return bail('You do not have permission to do that.');
+      if (isProtected(guild, gconf, targetId)) return bail('That user is protected and cannot be moderated.');
+      const targetMember = await guild.members.fetch(targetId).catch(() => null);
+      if (!targetMember) return bail('I could not find that member in this server.');
+      if (!actorOutranks(message.member, targetMember, guild, gconf) && !isBotOwner(message.author.id)) return bail('You cannot moderate someone with an equal or higher role.');
+      const reason = (parsed.reason || 'No reason provided').slice(0, 400);
+
+      if (parsed.action === 'warn') {
+        if (!gconf.warnings[targetId]) gconf.warnings[targetId] = [];
+        gconf.warnings[targetId].push({ reason, mod: message.author.id, ts: Date.now() });
+        saveDB();
+        await tryDM(targetMember.user, warnEmbed(`You were warned in **${guild.name}**: ${reason}`));
+        const embed = successEmbed(`${targetMember} has been warned.\nReason: ${reason}`, '🤖 Jarvis Action');
+        await logEvent(guild, gconf, embed);
+        await sendVantixNotice(guild, gconf, { userId: targetId, type: 'AI Chat', action: 'Warn', reason }, message.channel);
+        await message.reply({ embeds: [embed] }).catch(() => {});
+        return `Warned ${targetMember.user.tag}: ${reason}`;
+      }
+      if (!botCanActOn(guild, targetMember)) return bail("I don't have a high enough role to do that.");
+
+      if (parsed.action === 'timeout') {
+        const minutes = Math.max(1, Math.min(parseInt(parsed.minutes, 10) || 10, 40320));
+        await targetMember.timeout(minutes * 60 * 1000, reason).catch(() => {});
+        await tryDM(targetMember.user, warnEmbed(`You were timed out in **${guild.name}** for ${minutes}m: ${reason}`));
+        const embed = successEmbed(`${targetMember} has been timed out for ${minutes}m.\nReason: ${reason}`, '🤖 Jarvis Action');
+        await logEvent(guild, gconf, embed);
+        await sendVantixNotice(guild, gconf, { userId: targetId, type: 'AI Chat', action: `Timeout (${minutes}m)`, reason }, message.channel);
+        await message.reply({ embeds: [embed] }).catch(() => {});
+        return `Timed out ${targetMember.user.tag} for ${minutes}m: ${reason}`;
+      }
+      if (parsed.action === 'kick') {
+        await tryDM(targetMember.user, warnEmbed(`You were kicked from **${guild.name}**: ${reason}`));
+        await targetMember.kick(reason).catch(() => {});
+        const embed = successEmbed(`${targetMember} has been kicked.\nReason: ${reason}`, '🤖 Jarvis Action');
+        await logEvent(guild, gconf, embed);
+        await sendVantixNotice(guild, gconf, { userId: targetId, type: 'AI Chat', action: 'Kick', reason }, message.channel);
+        await message.reply({ embeds: [embed] }).catch(() => {});
+        return `Kicked ${targetMember.user.tag}: ${reason}`;
+      }
+      if (parsed.action === 'ban') {
+        await tryDM(targetMember.user, warnEmbed(`You were banned from **${guild.name}**: ${reason}`));
+        await guild.members.ban(targetId, { reason }).catch(() => {});
+        const embed = successEmbed(`${targetMember} has been banned.\nReason: ${reason}`, '🤖 Jarvis Action');
+        await logEvent(guild, gconf, embed);
+        await sendVantixNotice(guild, gconf, { userId: targetId, type: 'AI Chat', action: 'Ban', reason }, message.channel);
+        await message.reply({ embeds: [embed] }).catch(() => {});
+        return `Banned ${targetMember.user.tag}: ${reason}`;
+      }
+      break;
+    }
+    case 'purge': {
+      if (!hasPerm(PermissionFlagsBits.ManageMessages) && !isBotSuperAdmin(fakeInt, gconf)) return bail('You do not have permission to purge messages.');
+      const amount = Math.max(1, Math.min(parseInt(parsed.amount, 10) || 10, 100));
+      const deleted = await message.channel.bulkDelete(amount, true).catch(() => null);
+      if (!deleted) return bail('Could not delete messages (they may be older than 14 days).');
+      const embed = successEmbed(`Deleted ${deleted.size} messages.`, '🤖 Jarvis Action');
+      await logEvent(guild, gconf, embed);
+      await message.channel.send({ embeds: [embed] }).catch(() => {});
+      return `Purged ${deleted.size} messages.`;
+    }
+    case 'lock':
+    case 'unlock': {
+      if (!hasPerm(PermissionFlagsBits.ManageChannels) && !isBotSuperAdmin(fakeInt, gconf)) return bail('You do not have permission to do that.');
+      await message.channel.permissionOverwrites.edit(guild.roles.everyone, { SendMessages: parsed.action === 'lock' ? false : null });
+      await message.reply({ embeds: [successEmbed(`Channel ${parsed.action === 'lock' ? 'locked' : 'unlocked'}.`)] }).catch(() => {});
+      return `Channel ${parsed.action === 'lock' ? 'locked' : 'unlocked'}.`;
+    }
+    case 'slowmode': {
+      if (!hasPerm(PermissionFlagsBits.ManageChannels) && !isBotSuperAdmin(fakeInt, gconf)) return bail('You do not have permission to do that.');
+      const seconds = Math.max(0, Math.min(parseInt(parsed.seconds, 10) || 0, 21600));
+      await message.channel.setRateLimitPerUser(seconds).catch(() => {});
+      await message.reply({ embeds: [successEmbed(`Slowmode set to ${seconds}s.`)] }).catch(() => {});
+      return `Set slowmode to ${seconds}s.`;
+    }
+    case 'addrole':
+    case 'removerole': {
+      if (!hasPerm(PermissionFlagsBits.ManageRoles) && !isBotSuperAdmin(fakeInt, gconf)) return bail('You do not have permission to manage roles.');
+      const targetId = parsed.targetId;
+      const roleId = parsed.roleId;
+      if (!targetId || !roleId) return bail('The AI did not identify a valid user and role.');
+      const targetMember = await guild.members.fetch(targetId).catch(() => null);
+      const role = guild.roles.cache.get(roleId);
+      if (!targetMember || !role) return bail('Could not find that member or role.');
+      if (role.position >= guild.members.me.roles.highest.position) return bail("I can't manage a role positioned above or equal to my highest role.");
+      if (parsed.action === 'addrole') await targetMember.roles.add(role).catch(() => {});
+      else await targetMember.roles.remove(role).catch(() => {});
+      await message.reply({ embeds: [successEmbed(`${role} ${parsed.action === 'addrole' ? 'added to' : 'removed from'} ${targetMember}.`)] }).catch(() => {});
+      return `${parsed.action === 'addrole' ? 'Added' : 'Removed'} role ${role.name} ${parsed.action === 'addrole' ? 'to' : 'from'} ${targetMember.user.tag}.`;
+    }
+    case 'announcement': {
+      if (!requireLevel(fakeInt, gconf, LEVEL.ADMIN)) return bail('You do not have permission to send announcements.');
+      const channelId = parsed.channelId || message.channel.id;
+      const channel = await guild.channels.fetch(channelId).catch(() => null);
+      if (!channel) return bail('Could not find that channel.');
+      const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(`📢 ${parsed.title || 'Announcement'}`).setDescription(parsed.message || '').setTimestamp()
+        .setFooter({ text: `Announcement by ${message.author.tag} (via Jarvis)` });
+      await channel.send({ embeds: [embed] }).catch(() => {});
+      await message.reply({ embeds: [successEmbed(`Announcement posted in ${channel}.`)] }).catch(() => {});
+      return `Posted an announcement in #${channel.name}.`;
+    }
+    case 'remember': {
+      if (parsed.fact) aiRememberFact(gconf, message.author.id, parsed.fact.slice(0, 300));
+      await message.reply({ content: `Got it, I'll remember that: ${parsed.fact || ''}` }).catch(() => {});
+      return `Remembered: ${parsed.fact}`;
+    }
+    default:
+      await message.reply({ content: "I understood that as an action I don't know how to do yet." }).catch(() => {});
+      return 'Unknown action requested.';
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2320,6 +2486,51 @@ async function handleSlash(interaction) {
         return safeReply(interaction, { embeds: [infoEmbed(desc, 'Recent Applications')] });
       }
       break;
+    }
+
+    // ---------------- AI CONFIG (Super Admin only) ----------------
+    case 'aiconfig': {
+      if (!requireLevel(interaction, gconf, LEVEL.SUPER_ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Super Admin or higher.')], ephemeral: true });
+      const sub = interaction.options.getSubcommand();
+      if (sub === 'setprompt') {
+        gconf.ai.customPrompt = interaction.options.getString('prompt').slice(0, 2000);
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed('AI system prompt updated.')] });
+      }
+      if (sub === 'viewprompt') {
+        return safeReply(interaction, { embeds: [infoEmbed(gconf.ai.customPrompt || '*No custom prompt set — using default Jarvis persona.*', 'Current AI Prompt')] });
+      }
+      if (sub === 'resetprompt') {
+        gconf.ai.customPrompt = '';
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed('AI system prompt reset to default.')] });
+      }
+      if (sub === 'clearmemory') {
+        const user = interaction.options.getUser('user');
+        if (user) delete gconf.ai.memory[user.id];
+        else gconf.ai.memory = {};
+        saveDB();
+        return safeReply(interaction, { embeds: [successEmbed(user ? `Cleared AI memory for ${user}.` : 'Cleared all AI memory for this server.')] });
+      }
+      break;
+    }
+
+    // ---------------- ANNOUNCEMENT ----------------
+    case 'announcement': {
+      if (!requireLevel(interaction, gconf, LEVEL.ADMIN)) return safeReply(interaction, { embeds: [errorEmbed('Requires Administrator or higher.')], ephemeral: true });
+      const channel = interaction.options.getChannel('channel');
+      const title = interaction.options.getString('title');
+      const messageText = interaction.options.getString('message');
+      const ping = interaction.options.getString('ping') || 'none';
+      const banner = interaction.options.getString('banner');
+      const embed = new EmbedBuilder().setColor(COLORS.info).setTitle(`📢 ${title}`).setDescription(messageText).setTimestamp()
+        .setFooter({ text: `Announcement by ${interaction.user.tag}` });
+      if (banner) embed.setImage(banner);
+      const content = ping === 'everyone' ? '@everyone' : ping === 'here' ? '@here' : undefined;
+      const sent = await channel.send({ content, embeds: [embed] }).catch(() => null);
+      if (!sent) return safeReply(interaction, { embeds: [errorEmbed('Could not send the announcement (check my permissions in that channel).')], ephemeral: true });
+      if (channel.type === ChannelType.GuildAnnouncement) sent.crosspost().catch(() => {});
+      return safeReply(interaction, { embeds: [successEmbed(`Announcement posted in ${channel}.`)], ephemeral: true });
     }
 
     default:
